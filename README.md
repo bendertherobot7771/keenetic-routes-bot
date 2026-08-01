@@ -1,5 +1,7 @@
 # Keenetic Routes Bot
 
+🇷🇺 Русский | [🇬🇧 English](README.en.md)
+
 Telegram-бот для управления **штатной маршрутизацией KeeneticOS** прямо с
 роутера через Entware.
 
