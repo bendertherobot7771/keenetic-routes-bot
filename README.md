@@ -1,0 +1,281 @@
+# Keenetic Routes Bot
+
+Telegram-бот для управления **штатной маршрутизацией KeeneticOS** прямо с
+роутера через Entware.
+
+Бот работает с теми же системными объектами, что и веб-интерфейс Keenetic:
+
+- «Маршрутизация → Маршруты DNS» (`/staticRoutes/dns`);
+- «Маршрутизация → IPv4-маршруты» (`/staticRoutes/ipv4`).
+
+Он не создаёт собственные правила `iptables`, `ipset` или отдельный DNS-сервис.
+Все изменения видны в веб-панели и сохраняются штатной командой
+`system.configuration.save`.
+
+> Проект не является официальным продуктом Keenetic. Перед первым использованием
+> рекомендуется сохранить резервную копию конфигурации роутера.
+
+## Возможности
+
+- просмотр, создание, наполнение и удаление FQDN-списков;
+- добавление доменов, IP-адресов и CIDR по одному на строку;
+- отображение настоящих имён списков из веб-интерфейса Keenetic;
+- показ количества списков и общего количества сайтов;
+- создание, включение, выключение и удаление правил DNS-маршрутизации;
+- пакетное добавление и управление штатными IPv4-маршрутами;
+- просмотр системных ID интерфейсов;
+- режим `exclusive` для DNS-маршрутов;
+- подтверждение опасных операций;
+- доступ только для разрешённых Telegram user ID;
+- автоматический запуск вместе с Entware после перезагрузки роутера.
+
+## Как это работает
+
+Бот обращается к локальному RCI Keenetic по адресу
+`http://127.0.0.1:79/rci`. Пароль администратора роутера ему не нужен.
+
+| Объект | Чтение | Изменение |
+|---|---|---|
+| FQDN-списки | `show.sc.object-group.fqdn` | `object-group.fqdn` |
+| Правила DNS | `show.sc.dns-proxy.route` | `dns-proxy.route` |
+| IPv4-маршруты | `show.sc.ip.route` | `ip.route` |
+
+Telegram API опрашивается методом long polling. Внешний сервер, webhook и
+проброс портов на роутере не требуются.
+
+## Требования
+
+- KeeneticOS 5.0 или новее;
+- установленный и автоматически запускающийся Entware;
+- доступ роутера к `api.telegram.org`;
+- Telegram-бот, созданный через [@BotFather](https://t.me/BotFather);
+- числовой Telegram user ID каждого администратора;
+- SSH-доступ к Entware для установки.
+
+Проект проверен на Keenetic Ultra KN-1811 с KeeneticOS 5.1.1. Установщик сам
+добавляет из Entware `python3`, `ca-certificates` и `daemonize`.
+
+## Подготовка Telegram-бота
+
+1. Откройте [@BotFather](https://t.me/BotFather).
+2. Выполните `/newbot` и сохраните полученный токен.
+3. Узнайте свой числовой Telegram user ID.
+4. Не публикуйте токен и не добавляйте его в Git.
+
+Бот не может первым начать переписку. После установки откройте его в Telegram и
+отправьте `/start`.
+
+## Установка
+
+### Вариант 1: архив GitHub
+
+Подключитесь по SSH к Entware и выполните:
+
+```sh
+cd /opt/tmp
+wget -O keenetic-routes-bot.tar.gz \
+  https://github.com/bendertherobot7771/keenetic-routes-bot/archive/refs/heads/master.tar.gz
+tar -xzf keenetic-routes-bot.tar.gz
+cd keenetic-routes-bot-master
+sh scripts/install.sh
+```
+
+### Вариант 2: копирование с компьютера
+
+Скопируйте каталог проекта или готовый Entware-архив в `/opt/tmp`, затем:
+
+```sh
+cd /opt/tmp/keenetic-routes-bot
+sh scripts/install.sh
+```
+
+Установщик запросит:
+
+1. токен BotFather;
+2. разрешённые Telegram user ID через запятую;
+3. системный ID интерфейса по умолчанию, например `u1Host`.
+
+После установки проверьте службу:
+
+```sh
+/opt/bin/keenetic-routes-bot check
+/opt/bin/keenetic-routes-bot status
+```
+
+## Где хранится конфигурация
+
+Основной файл:
+
+```text
+/opt/etc/keenetic-routes-bot/config.env
+```
+
+Он создаётся с правами `600`, поэтому читать его может только `root`. В нём
+хранятся токен BotFather, allowlist администраторов и параметры RCI.
+
+```dotenv
+BOT_TOKEN="1234567890:replace_me"
+ALLOWED_USERS="123456789,987654321"
+RCI_URL="http://127.0.0.1:79/rci"
+DEFAULT_INTERFACE="u1Host"
+PRIVATE_CHATS_ONLY="true"
+MAX_GROUP_ENTRIES="300"
+```
+
+Конфигурация сохраняется при обычном обновлении и удалении бота. Она пропадёт
+только при запуске удаления с `--purge`, очистке накопителя или повреждении
+раздела Entware.
+
+После ручного редактирования перезапустите службу:
+
+```sh
+/opt/bin/keenetic-routes-bot restart
+```
+
+## Автозапуск и управление службой
+
+Установщик создаёт исполняемый init-скрипт:
+
+```text
+/opt/etc/init.d/S99keenetic-routes-bot
+```
+
+Entware запускает его автоматически после монтирования `/opt`. Накопитель с
+Entware должен быть подключён и исправен.
+
+Команды управления:
+
+```sh
+/opt/bin/keenetic-routes-bot start
+/opt/bin/keenetic-routes-bot stop
+/opt/bin/keenetic-routes-bot restart
+/opt/bin/keenetic-routes-bot status
+/opt/bin/keenetic-routes-bot check
+/opt/bin/keenetic-routes-bot logs
+```
+
+Журнал хранится в `/opt/var/log/keenetic-routes-bot.log`. Токен Telegram в него
+не выводится.
+
+## Команды Telegram
+
+| Команда | Назначение |
+|---|---|
+| `/start`, `/menu` | Главное меню |
+| `/lists` | FQDN-списки и их содержимое |
+| `/rules` | Правила DNS-маршрутизации |
+| `/routes` | Штатные IPv4-маршруты |
+| `/interfaces` | Системные ID интерфейсов |
+| `/status` | Версия KeeneticOS и количество объектов |
+| `/cancel` | Отмена текущего ввода |
+| `/help` | Краткая справка |
+
+### Домены и адреса
+
+При добавлении в список отправляйте по одной записи на строку:
+
+```text
+example.com
+api.example.com
+192.0.2.0/24
+2001:db8::/32
+```
+
+`*.example.com` нормализуется в `example.com`: Keenetic сам учитывает поддомены.
+URL с протоколом или путём, например `https://example.com/page`, не принимается.
+
+### IPv4-маршруты
+
+Формат одной строки:
+
+```text
+CIDR INTERFACE описание
+```
+
+Пример пакетного добавления:
+
+```text
+149.154.160.0/20 u1Host telegram
+91.108.4.0/22 u1Host telegram
+31.13.64.0/18 u1Host "social networks"
+```
+
+Если задан `DEFAULT_INTERFACE`, поле интерфейса можно не указывать.
+
+## Обновление
+
+Скачайте свежий архив ветки `master`, распакуйте его и снова запустите
+`scripts/install.sh`. Установщик остановит старый процесс, обновит приложение и
+init-скрипты, сохранит существующий `config.env`, выполнит проверку RCI и запустит
+бота.
+
+```sh
+cd /opt/tmp/keenetic-routes-bot-master
+sh scripts/install.sh
+```
+
+## Удаление
+
+Удалить приложение, сохранив токен и список администраторов:
+
+```sh
+sh scripts/uninstall.sh
+```
+
+Удалить приложение вместе с конфигурацией:
+
+```sh
+sh scripts/uninstall.sh --purge
+```
+
+DNS-списки и маршруты Keenetic при удалении бота не изменяются.
+
+## Важные особенности DNS-маршрутизации
+
+- Клиенты должны использовать Keenetic как DNS-сервер. Собственный DoH/DoT в
+  приложении может обойти механизм FQDN-групп.
+- KeeneticOS 5.1 ограничивает один список 300 записями. Лимит бота настраивается
+  через `MAX_GROUP_ENTRIES`.
+- Нельзя удалить список, пока на него ссылается правило DNS.
+- Режим `exclusive` запрещает уход маршрута через другой канал, если выбранный
+  интерфейс недоступен.
+- В KeeneticOS 5.1 правила DNS относятся к политике подключения по умолчанию.
+
+Официальная документация:
+
+- [DNS-based routes](https://support.keenetic.ua/extra/kn-1711/en/51150-dns-based-routes.html);
+- [KeeneticOS 5.0: object-group fqdn и dns-proxy route](https://support.keenetic.com/titan/kn-1812/en/100151-os-5-0.html).
+
+## Безопасность
+
+- Никогда не публикуйте `config.env` и токен BotFather.
+- Разрешайте доступ только известным Telegram user ID.
+- По умолчанию бот принимает команды только из личных чатов.
+- Не открывайте локальный RCI-порт роутера в интернет.
+- После передачи временного SSH-доступа смените пароль.
+- При утечке токена перевыпустите его через BotFather и обновите `BOT_TOKEN`.
+
+`.gitignore` исключает `config.env`, `.env`, журналы, сборочные каталоги и
+Python-кэш.
+
+## Разработка и тесты
+
+Во время выполнения используются только модули стандартной библиотеки Python.
+
+```sh
+python -m compileall -q keenetic_routes_bot
+python -m unittest discover -s tests -v
+```
+
+Тесты покрывают модели RCI, сохранение штатной конфигурации, нормализацию
+доменов/CIDR, загрузку настроек и основные сценарии Telegram. Для локального
+развёртывания через `scripts/deploy_ssh.py` дополнительно нужен `paramiko`; пароль
+и токен передаются только через переменные окружения и не записываются в проект.
+
+## Лицензия
+
+[MIT](LICENSE).
+
+Идея Entware-сервиса и Telegram-меню вдохновлена проектом
+[KVAS VPN Bot](https://github.com/flathead/kvas_bot). Реализация RCI написана
+отдельно для штатной маршрутизации KeeneticOS.

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keenetic-routes-bot"
+version = "0.1.0"
+description = "Telegram bot for managing native Keenetic DNS-based and IPv4 routes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Keenetic Routes Bot contributors" }]
+dependencies = []
+
+[project.scripts]
+keenetic-routes-bot = "keenetic_routes_bot.main:main"
+
+[tool.setuptools.packages.find]
+include = ["keenetic_routes_bot*"]

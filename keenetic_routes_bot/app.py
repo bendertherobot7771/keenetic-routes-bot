@@ -1,0 +1,920 @@
+from __future__ import annotations
+
+import html
+import logging
+import shlex
+import time
+from collections import defaultdict, deque
+from dataclasses import replace
+from typing import Any
+
+from .config import Config
+from .models import DnsRoute, FqdnGroup
+from .rci import KeeneticRciClient, RciError
+from .telegram import TelegramClient, TelegramError, inline_keyboard
+from .validation import (
+    ValidationError,
+    merge_entries,
+    normalize_group_name,
+    normalize_interface,
+    parse_entries,
+    parse_ipv4_routes,
+    remove_entries,
+)
+
+
+class BotApp:
+    def __init__(
+        self,
+        config: Config,
+        telegram: TelegramClient,
+        router: KeeneticRciClient,
+        *,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.config = config
+        self.telegram = telegram
+        self.router = router
+        self.logger = logger or logging.getLogger(__name__)
+        self.sessions: dict[int, dict[str, Any]] = defaultdict(dict)
+        self.request_times: dict[int, deque[float]] = defaultdict(deque)
+
+    def run(self) -> None:
+        offset: int | None = None
+        retry_delay = 2
+        self.logger.info("Bot polling started")
+        while True:
+            try:
+                updates = self.telegram.get_updates(
+                    offset=offset, timeout=self.config.poll_timeout
+                )
+                retry_delay = 2
+                for update in updates:
+                    update_id = int(update.get("update_id", 0))
+                    offset = max(offset or 0, update_id + 1)
+                    try:
+                        self.handle_update(update)
+                    except Exception:
+                        self.logger.exception(
+                            "Unhandled update error, update_id=%s", update_id
+                        )
+                        chat_id = _chat_id(update)
+                        if chat_id is not None:
+                            self._send(
+                                chat_id,
+                                "❌ Внутренняя ошибка. Подробности записаны в журнал.",
+                                keyboard=self._home_keyboard(),
+                            )
+            except TelegramError as exc:
+                self.logger.warning("%s; retry in %s seconds", exc, retry_delay)
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 30)
+
+    def handle_update(self, update: dict[str, Any]) -> None:
+        callback = update.get("callback_query")
+        message = update.get("message")
+        actor = (callback or message or {}).get("from") or {}
+        user_id = int(actor.get("id", 0))
+        chat = (
+            (callback or {}).get("message", {}).get("chat")
+            if callback
+            else (message or {}).get("chat")
+        ) or {}
+        chat_id = int(chat.get("id", 0))
+        if user_id not in self.config.allowed_users:
+            self.logger.warning("Access denied for Telegram user_id=%s", user_id)
+            if callback:
+                self.telegram.answer_callback_query(
+                    str(callback.get("id", "")),
+                    text="Доступ запрещён.",
+                    show_alert=True,
+                )
+            elif chat_id:
+                self._send(chat_id, "⛔ Доступ запрещён.")
+            return
+        if self.config.private_chats_only and chat.get("type") != "private":
+            if callback:
+                self.telegram.answer_callback_query(
+                    str(callback.get("id", "")),
+                    text="Бот работает только в личном чате.",
+                    show_alert=True,
+                )
+            elif chat_id:
+                self._send(chat_id, "⛔ Используйте личный чат с ботом.")
+            return
+        if not self._rate_limit_ok(user_id):
+            if callback:
+                self.telegram.answer_callback_query(
+                    str(callback.get("id", "")),
+                    text="Слишком много команд. Повторите через минуту.",
+                    show_alert=True,
+                )
+            else:
+                self._send(chat_id, "⏳ Слишком много команд. Повторите через минуту.")
+            return
+        if callback:
+            callback_id = str(callback.get("id", ""))
+            self.telegram.answer_callback_query(callback_id)
+            self._handle_callback(user_id, chat_id, str(callback.get("data", "")))
+            return
+        if message:
+            text = str(message.get("text", "")).strip()
+            if text:
+                self._handle_message(user_id, chat_id, text)
+
+    def _handle_message(self, user_id: int, chat_id: int, text: str) -> None:
+        command = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+        if command in {"/start", "/menu"}:
+            self.sessions[user_id].clear()
+            self._send(
+                chat_id,
+                "<b>Keenetic Routes Bot</b>\n\n"
+                "Управляет штатными DNS-списками и IPv4-маршрутами Keenetic.",
+                keyboard=self._home_keyboard(),
+            )
+            return
+        if command == "/help":
+            self._send_help(chat_id)
+            return
+        if command == "/cancel":
+            self.sessions[user_id].clear()
+            self._send(chat_id, "Операция отменена.", keyboard=self._home_keyboard())
+            return
+        command_callbacks = {
+            "/status": "status",
+            "/lists": "groups",
+            "/rules": "rules",
+            "/routes": "routes",
+            "/interfaces": "interfaces",
+        }
+        if command in command_callbacks:
+            self._handle_callback(user_id, chat_id, command_callbacks[command])
+            return
+        action = str(self.sessions[user_id].get("action", ""))
+        if not action:
+            self._send(
+                chat_id,
+                "Выберите действие в меню или используйте /help.",
+                keyboard=self._home_keyboard(),
+            )
+            return
+        try:
+            handler = getattr(self, f"_state_{action}")
+            handler(user_id, chat_id, text)
+        except AttributeError:
+            self.sessions[user_id].clear()
+            self._send(chat_id, "Состояние диалога сброшено. Откройте меню заново.")
+        except (ValidationError, RciError) as exc:
+            self._send(chat_id, f"❌ {html.escape(str(exc))}")
+
+    def _handle_callback(self, user_id: int, chat_id: int, callback_data: str) -> None:
+        try:
+            if callback_data == "home":
+                self.sessions[user_id].clear()
+                self._send(
+                    chat_id,
+                    "<b>Главное меню</b>",
+                    keyboard=self._home_keyboard(),
+                )
+            elif callback_data == "status":
+                self._show_status(chat_id)
+            elif callback_data == "interfaces":
+                self._show_interfaces(chat_id)
+            elif callback_data == "groups":
+                self._show_groups(user_id, chat_id)
+            elif callback_data == "group_new":
+                self.sessions[user_id] = {"action": "create_group_name"}
+                self._send(
+                    chat_id,
+                    "Введите имя нового списка (до 64 символов).\n\n/cancel — отмена",
+                )
+            elif callback_data.startswith("g:"):
+                self._select_group(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
+            elif callback_data == "g_show":
+                self._show_group_entries(user_id, chat_id)
+            elif callback_data == "g_add":
+                self.sessions[user_id]["action"] = "add_group_entries"
+                self._send(
+                    chat_id,
+                    "Отправьте домены, IP-адреса или CIDR — по одному в строке.\n"
+                    "Поддомены учитываются автоматически; <code>*.</code> не нужен.",
+                )
+            elif callback_data == "g_remove":
+                self.sessions[user_id]["action"] = "remove_group_entries"
+                self._send(
+                    chat_id,
+                    "Отправьте записи для удаления — по одной в строке.",
+                )
+            elif callback_data == "g_attach":
+                self.sessions[user_id]["action"] = "attach_group"
+                default_hint = (
+                    f"\nПо умолчанию: <code>{html.escape(self.config.default_interface)}</code>"
+                    if self.config.default_interface
+                    else ""
+                )
+                self._send(
+                    chat_id,
+                    "Введите системный ID интерфейса и необязательный режим "
+                    "<code>exclusive</code>.\n"
+                    "Пример: <code>u1Host exclusive</code>"
+                    f"{default_hint}\n\n/interfaces — показать интерфейсы",
+                )
+            elif callback_data == "g_delete":
+                self._prepare_group_delete(user_id, chat_id)
+            elif callback_data == "g_delete_yes":
+                self._confirm_group_delete(user_id, chat_id)
+            elif callback_data == "rules":
+                self._show_rules(user_id, chat_id)
+            elif callback_data.startswith("r:"):
+                self._select_rule(user_id, chat_id, int(callback_data.split(":", 1)[1]))
+            elif callback_data == "r_toggle":
+                self._toggle_rule(user_id, chat_id)
+            elif callback_data == "r_delete":
+                self._prepare_rule_delete(user_id, chat_id)
+            elif callback_data == "r_delete_yes":
+                self._confirm_rule_delete(user_id, chat_id)
+            elif callback_data == "routes":
+                self._show_ipv4_routes(user_id, chat_id)
+            elif callback_data == "route_add":
+                self.sessions[user_id] = {"action": "add_ipv4_routes"}
+                default_hint = (
+                    f"\nИнтерфейс по умолчанию: "
+                    f"<code>{html.escape(self.config.default_interface)}</code>"
+                    if self.config.default_interface
+                    else ""
+                )
+                self._send(
+                    chat_id,
+                    "Отправьте маршруты по одному в строке:\n"
+                    "<code>CIDR INTERFACE описание</code>\n\n"
+                    "Пример:\n"
+                    "<code>149.154.160.0/20 u1Host telegram</code>"
+                    f"{default_hint}",
+                )
+            elif callback_data.startswith("ip:"):
+                self._select_ipv4_route(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
+            elif callback_data == "ip_toggle":
+                self._toggle_ipv4_route(user_id, chat_id)
+            elif callback_data == "ip_delete":
+                self._prepare_ipv4_delete(user_id, chat_id)
+            elif callback_data == "ip_delete_yes":
+                self._confirm_ipv4_delete(user_id, chat_id)
+            else:
+                self._send(
+                    chat_id,
+                    "Кнопка устарела. Откройте нужный раздел заново.",
+                    keyboard=self._home_keyboard(),
+                )
+        except (ValidationError, RciError) as exc:
+            self.logger.warning("Operation failed: %s", exc)
+            self._send(
+                chat_id,
+                f"❌ {html.escape(str(exc))}",
+                keyboard=self._home_keyboard(),
+            )
+        except (ValueError, IndexError):
+            self._send(
+                chat_id,
+                "Список изменился. Откройте раздел заново.",
+                keyboard=self._home_keyboard(),
+            )
+
+    def _state_create_group_name(self, user_id: int, chat_id: int, text: str) -> None:
+        name = normalize_group_name(text)
+        if any(group.name == name for group in self.router.list_groups()):
+            raise ValidationError("Список с таким именем уже существует.")
+        self.sessions[user_id] = {
+            "action": "create_group_entries",
+            "pending_group": name,
+        }
+        self._send(
+            chat_id,
+            f"Список <b>{html.escape(name)}</b>.\n"
+            "Теперь отправьте домены, IP-адреса или CIDR — по одному в строке.",
+        )
+
+    def _state_create_group_entries(
+        self, user_id: int, chat_id: int, text: str
+    ) -> None:
+        name = str(self.sessions[user_id]["pending_group"])
+        entries = parse_entries(text)
+        self._validate_group_size(entries)
+        self.router.save_group(
+            FqdnGroup(name=name, description=name, entries=entries),
+            replace=False,
+        )
+        self.sessions[user_id] = {"current_group": name}
+        self.logger.info(
+            "Telegram user_id=%s created FQDN group=%r entries=%s",
+            user_id,
+            name,
+            len(entries),
+        )
+        self._send(
+            chat_id,
+            f"✅ Список <b>{html.escape(name)}</b> создан: {len(entries)} записей.",
+            keyboard=self._group_keyboard(),
+        )
+
+    def _state_add_group_entries(self, user_id: int, chat_id: int, text: str) -> None:
+        group = self._current_group(user_id)
+        additions = parse_entries(text)
+        entries = merge_entries(group.entries, additions)
+        self._validate_group_size(entries)
+        added_count = len(entries) - len(group.entries)
+        self.router.save_group(replace(group, entries=entries))
+        self.sessions[user_id] = {"current_group": group.name}
+        self.logger.info(
+            "Telegram user_id=%s added entries to group=%r count=%s",
+            user_id,
+            group.name,
+            added_count,
+        )
+        self._send(
+            chat_id,
+            f"✅ Добавлено: {added_count}. Всего: {len(entries)}.",
+            keyboard=self._group_keyboard(),
+        )
+
+    def _state_remove_group_entries(
+        self, user_id: int, chat_id: int, text: str
+    ) -> None:
+        group = self._current_group(user_id)
+        removals = parse_entries(text)
+        entries, missing = remove_entries(group.entries, removals)
+        removed_count = len(group.entries) - len(entries)
+        if removed_count == 0:
+            raise ValidationError("Ни одна из указанных записей не найдена.")
+        self.router.save_group(replace(group, entries=entries))
+        self.sessions[user_id] = {"current_group": group.name}
+        suffix = f" Не найдено: {len(missing)}." if missing else ""
+        self.logger.info(
+            "Telegram user_id=%s removed entries from group=%r count=%s",
+            user_id,
+            group.name,
+            removed_count,
+        )
+        self._send(
+            chat_id,
+            f"✅ Удалено: {removed_count}. Осталось: {len(entries)}.{suffix}",
+            keyboard=self._group_keyboard(),
+        )
+
+    def _state_attach_group(self, user_id: int, chat_id: int, text: str) -> None:
+        group = self._current_group(user_id)
+        parts = shlex.split(text)
+        interface_value = parts[0] if parts else self.config.default_interface
+        if interface_value in {".", "-"}:
+            interface_value = self.config.default_interface
+        interface = normalize_interface(interface_value)
+        exclusive = any(
+            part.casefold() in {"exclusive", "эксклюзивный", "reject"}
+            for part in parts[1:]
+        )
+        existing = next(
+            (
+                route
+                for route in self.router.list_dns_routes()
+                if route.group == group.name and route.interface == interface
+            ),
+            None,
+        )
+        route = DnsRoute(
+            index=existing.index if existing else "",
+            group=group.name,
+            interface=interface,
+            auto=True,
+            reject=exclusive,
+            enabled=True,
+        )
+        self.router.save_dns_route(route)
+        self.sessions[user_id] = {"current_group": group.name}
+        self.logger.info(
+            "Telegram user_id=%s attached group=%r interface=%r exclusive=%s",
+            user_id,
+            group.name,
+            interface,
+            exclusive,
+        )
+        self._send(
+            chat_id,
+            f"✅ Список <b>{html.escape(group.name)}</b> направлен через "
+            f"<code>{html.escape(interface)}</code>.\n"
+            f"Эксклюзивный маршрут: {'да' if exclusive else 'нет'}.",
+            keyboard=self._group_keyboard(),
+        )
+
+    def _state_add_ipv4_routes(self, user_id: int, chat_id: int, text: str) -> None:
+        routes = parse_ipv4_routes(
+            text, default_interface=self.config.default_interface
+        )
+        existing_destinations = {
+            (route.destination, route.interface)
+            for route in self.router.list_ipv4_routes()
+        }
+        new_routes = tuple(
+            route
+            for route in routes
+            if (route.destination, route.interface) not in existing_destinations
+        )
+        if not new_routes:
+            raise ValidationError("Все указанные маршруты уже существуют.")
+        self.router.add_ipv4_routes(new_routes)
+        self.sessions[user_id].clear()
+        self.logger.info(
+            "Telegram user_id=%s added IPv4 routes count=%s",
+            user_id,
+            len(new_routes),
+        )
+        self._send(
+            chat_id,
+            f"✅ Добавлено IPv4-маршрутов: {len(new_routes)}.",
+            keyboard=self._routes_keyboard(),
+        )
+
+    def _show_status(self, chat_id: int) -> None:
+        version = self.router.version()
+        release = (
+            version.get("release")
+            or version.get("version")
+            or version.get("title")
+            or "неизвестно"
+        )
+        groups = self.router.list_groups()
+        rules = self.router.list_dns_routes()
+        routes = self.router.list_ipv4_routes()
+        group_entries = sum(len(group.entries) for group in groups)
+        self._send(
+            chat_id,
+            "<b>Статус</b>\n\n"
+            f"KeeneticOS: <code>{html.escape(str(release))}</code>\n"
+            f"DNS-списков: <b>{len(groups)}</b> (сайтов: <b>{group_entries}</b>)\n"
+            f"Правил DNS: <b>{len(rules)}</b>\n"
+            f"IPv4-маршрутов: <b>{len(routes)}</b>",
+            keyboard=inline_keyboard(
+                [[("🔄 Обновить", "status")], [("← Меню", "home")]]
+            ),
+        )
+
+    def _show_interfaces(self, chat_id: int) -> None:
+        interfaces = self.router.list_interfaces()
+        if not interfaces:
+            self._send(
+                chat_id,
+                "Интерфейсы не найдены.",
+                keyboard=inline_keyboard([[("← Меню", "home")]]),
+            )
+            return
+        lines = ["<b>Системные ID интерфейсов</b>", ""]
+        for interface in interfaces[:80]:
+            marker = "🟢" if interface.connected else "⚪"
+            lines.append(
+                f"{marker} <code>{html.escape(interface.ident)}</code> — "
+                f"{html.escape(interface.description)}"
+            )
+        if len(interfaces) > 80:
+            lines.append(f"\n…ещё {len(interfaces) - 80}")
+        self._send_paginated_lines(
+            chat_id,
+            lines,
+            final_keyboard=inline_keyboard([[("← Меню", "home")]]),
+        )
+
+    def _show_groups(self, user_id: int, chat_id: int) -> None:
+        groups = self.router.list_groups()
+        self.sessions[user_id].clear()
+        rows: list[list[tuple[str, str]]] = []
+        for index, group in enumerate(groups):
+            display_name = group.description or group.name
+            rows.append(
+                [
+                    (
+                        f"🌐 {display_name} · {len(group.entries)}",
+                        f"g:{index}",
+                    )
+                ]
+            )
+        rows.extend([[("➕ Новый список", "group_new")], [("← Меню", "home")]])
+        self._send(
+            chat_id,
+            f"<b>DNS-списки</b>\n\nВсего: {len(groups)}",
+            keyboard=inline_keyboard(rows),
+        )
+
+    def _select_group(self, user_id: int, chat_id: int, index: int) -> None:
+        group = self.router.list_groups()[index]
+        self.sessions[user_id] = {"current_group": group.name}
+        display_name = group.description or group.name
+        linked = [
+            route
+            for route in self.router.list_dns_routes()
+            if route.group == group.name
+        ]
+        links = (
+            ", ".join(
+                f"<code>{html.escape(route.interface or route.gateway or 'любой')}</code>"
+                for route in linked
+            )
+            or "нет"
+        )
+        self._send(
+            chat_id,
+            f"<b>{html.escape(display_name)}</b>\n\n"
+            f"Записей: <b>{len(group.entries)}</b>\n"
+            f"Правила: {links}",
+            keyboard=self._group_keyboard(),
+        )
+
+    def _show_group_entries(self, user_id: int, chat_id: int) -> None:
+        group = self._current_group(user_id)
+        if not group.entries:
+            self._send(
+                chat_id,
+                f"Список <b>{html.escape(group.name)}</b> пуст.",
+                keyboard=self._group_keyboard(),
+            )
+            return
+        lines = [f"<code>{html.escape(entry)}</code>" for entry in group.entries]
+        self._send_paginated_lines(
+            chat_id,
+            lines,
+            title=f"<b>{html.escape(group.name)}</b>",
+            final_keyboard=self._group_keyboard(),
+        )
+
+    def _prepare_group_delete(self, user_id: int, chat_id: int) -> None:
+        group = self._current_group(user_id)
+        linked = [
+            route
+            for route in self.router.list_dns_routes()
+            if route.group == group.name
+        ]
+        if linked:
+            raise ValidationError(
+                f"Список используется в {len(linked)} правилах. "
+                "Сначала удалите связанные правила DNS."
+            )
+        self.sessions[user_id]["confirm_group_delete"] = group.name
+        self._send(
+            chat_id,
+            f"Удалить список <b>{html.escape(group.name)}</b> и все "
+            f"{len(group.entries)} записей?",
+            keyboard=inline_keyboard(
+                [
+                    [("🗑 Да, удалить", "g_delete_yes")],
+                    [("Отмена", "groups")],
+                ]
+            ),
+        )
+
+    def _confirm_group_delete(self, user_id: int, chat_id: int) -> None:
+        name = str(self.sessions[user_id].get("confirm_group_delete", ""))
+        if not name:
+            raise ValidationError("Подтверждение устарело.")
+        self.router.delete_group(name)
+        self.sessions[user_id].clear()
+        self.logger.info("Telegram user_id=%s deleted FQDN group=%r", user_id, name)
+        self._send(
+            chat_id,
+            f"✅ Список <b>{html.escape(name)}</b> удалён.",
+            keyboard=inline_keyboard(
+                [[("DNS-списки", "groups")], [("← Меню", "home")]]
+            ),
+        )
+
+    def _show_rules(self, user_id: int, chat_id: int) -> None:
+        rules = self.router.list_dns_routes()
+        self.sessions[user_id].clear()
+        rows: list[list[tuple[str, str]]] = []
+        for position, route in enumerate(rules):
+            marker = "🟢" if route.enabled else "⚪"
+            target = route.interface or route.gateway or "любой"
+            rows.append(
+                [
+                    (
+                        f"{marker} {route.group} → {target}",
+                        f"r:{position}",
+                    )
+                ]
+            )
+        rows.extend([[("DNS-списки", "groups")], [("← Меню", "home")]])
+        self._send(
+            chat_id,
+            f"<b>Правила DNS-маршрутизации</b>\n\nВсего: {len(rules)}",
+            keyboard=inline_keyboard(rows),
+        )
+
+    def _select_rule(self, user_id: int, chat_id: int, position: int) -> None:
+        route = self.router.list_dns_routes()[position]
+        self.sessions[user_id] = {
+            "current_rule": route.index,
+            "current_rule_group": route.group,
+        }
+        target = route.interface or route.gateway or "любой интерфейс"
+        self._send(
+            chat_id,
+            f"<b>{html.escape(route.group)}</b>\n\n"
+            f"Назначение: <code>{html.escape(target)}</code>\n"
+            f"Включено: {'да' if route.enabled else 'нет'}\n"
+            f"Автоматически: {'да' if route.auto else 'нет'}\n"
+            f"Эксклюзивный: {'да' if route.reject else 'нет'}",
+            keyboard=self._rule_keyboard(route.enabled),
+        )
+
+    def _toggle_rule(self, user_id: int, chat_id: int) -> None:
+        route = self._current_rule(user_id)
+        self.router.set_dns_route_enabled(route.index, not route.enabled)
+        self.logger.info(
+            "Telegram user_id=%s toggled DNS rule index=%r enabled=%s",
+            user_id,
+            route.index,
+            not route.enabled,
+        )
+        self._send(
+            chat_id,
+            f"✅ Правило {'включено' if not route.enabled else 'выключено'}.",
+            keyboard=inline_keyboard(
+                [[("← К правилам", "rules")], [("← Меню", "home")]]
+            ),
+        )
+
+    def _prepare_rule_delete(self, user_id: int, chat_id: int) -> None:
+        route = self._current_rule(user_id)
+        self.sessions[user_id]["confirm_rule_delete"] = route.index
+        self._send(
+            chat_id,
+            f"Удалить правило для списка <b>{html.escape(route.group)}</b>?",
+            keyboard=inline_keyboard(
+                [
+                    [("🗑 Да, удалить", "r_delete_yes")],
+                    [("Отмена", "rules")],
+                ]
+            ),
+        )
+
+    def _confirm_rule_delete(self, user_id: int, chat_id: int) -> None:
+        index = str(self.sessions[user_id].get("confirm_rule_delete", ""))
+        if not index:
+            raise ValidationError("Подтверждение устарело.")
+        self.router.delete_dns_route(index)
+        self.sessions[user_id].clear()
+        self.logger.info(
+            "Telegram user_id=%s deleted DNS rule index=%r", user_id, index
+        )
+        self._send(
+            chat_id,
+            "✅ Правило DNS удалено.",
+            keyboard=inline_keyboard(
+                [[("← К правилам", "rules")], [("← Меню", "home")]]
+            ),
+        )
+
+    def _show_ipv4_routes(self, user_id: int, chat_id: int) -> None:
+        routes = self.router.list_ipv4_routes()
+        self.sessions[user_id].clear()
+        rows: list[list[tuple[str, str]]] = []
+        for position, route in enumerate(routes[:90]):
+            marker = "🟢" if route.enabled else "⚪"
+            target = route.interface or route.gateway or "любой"
+            rows.append(
+                [
+                    (
+                        f"{marker} {route.destination} → {target}",
+                        f"ip:{position}",
+                    )
+                ]
+            )
+        rows.extend([[("➕ Добавить", "route_add")], [("← Меню", "home")]])
+        suffix = "\nПоказаны первые 90." if len(routes) > 90 else ""
+        self._send(
+            chat_id,
+            f"<b>Пользовательские IPv4-маршруты</b>\n\nВсего: {len(routes)}{suffix}",
+            keyboard=inline_keyboard(rows),
+        )
+
+    def _select_ipv4_route(self, user_id: int, chat_id: int, position: int) -> None:
+        route = self.router.list_ipv4_routes()[position]
+        self.sessions[user_id] = {"current_ipv4_route": route.index}
+        target = route.interface or route.gateway or "любой"
+        self._send(
+            chat_id,
+            f"<b>{html.escape(route.destination)}</b>\n\n"
+            f"Назначение: <code>{html.escape(target)}</code>\n"
+            f"Описание: {html.escape(route.comment or '—')}\n"
+            f"Включено: {'да' if route.enabled else 'нет'}\n"
+            f"Автоматически: {'да' if route.auto else 'нет'}\n"
+            f"Эксклюзивный: {'да' if route.reject else 'нет'}",
+            keyboard=self._ipv4_route_keyboard(route.enabled),
+        )
+
+    def _toggle_ipv4_route(self, user_id: int, chat_id: int) -> None:
+        route = self._current_ipv4_route(user_id)
+        self.router.set_ipv4_route_enabled(route.index, not route.enabled)
+        self.logger.info(
+            "Telegram user_id=%s toggled IPv4 route index=%r enabled=%s",
+            user_id,
+            route.index,
+            not route.enabled,
+        )
+        self._send(
+            chat_id,
+            f"✅ Маршрут {'включён' if not route.enabled else 'выключен'}.",
+            keyboard=self._routes_keyboard(),
+        )
+
+    def _prepare_ipv4_delete(self, user_id: int, chat_id: int) -> None:
+        route = self._current_ipv4_route(user_id)
+        self.sessions[user_id]["confirm_ipv4_delete"] = route.index
+        self._send(
+            chat_id,
+            f"Удалить маршрут <code>{html.escape(route.destination)}</code>?",
+            keyboard=inline_keyboard(
+                [
+                    [("🗑 Да, удалить", "ip_delete_yes")],
+                    [("Отмена", "routes")],
+                ]
+            ),
+        )
+
+    def _confirm_ipv4_delete(self, user_id: int, chat_id: int) -> None:
+        index = str(self.sessions[user_id].get("confirm_ipv4_delete", ""))
+        if not index:
+            raise ValidationError("Подтверждение устарело.")
+        self.router.delete_ipv4_route(index)
+        self.sessions[user_id].clear()
+        self.logger.info(
+            "Telegram user_id=%s deleted IPv4 route index=%r", user_id, index
+        )
+        self._send(
+            chat_id,
+            "✅ IPv4-маршрут удалён.",
+            keyboard=self._routes_keyboard(),
+        )
+
+    def _current_group(self, user_id: int) -> FqdnGroup:
+        name = str(self.sessions[user_id].get("current_group", ""))
+        group = self.router.get_group(name)
+        if group is None:
+            raise ValidationError("Список больше не существует.")
+        return group
+
+    def _current_rule(self, user_id: int) -> DnsRoute:
+        index = str(self.sessions[user_id].get("current_rule", ""))
+        route = next(
+            (item for item in self.router.list_dns_routes() if item.index == index),
+            None,
+        )
+        if route is None:
+            raise ValidationError("Правило больше не существует.")
+        return route
+
+    def _current_ipv4_route(self, user_id: int):
+        index = str(self.sessions[user_id].get("current_ipv4_route", ""))
+        route = next(
+            (item for item in self.router.list_ipv4_routes() if item.index == index),
+            None,
+        )
+        if route is None:
+            raise ValidationError("Маршрут больше не существует.")
+        return route
+
+    def _send(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        keyboard: dict[str, Any] | None = None,
+    ) -> None:
+        self.telegram.send_message(chat_id, text, reply_markup=keyboard)
+
+    def _send_paginated_lines(
+        self,
+        chat_id: int,
+        lines: list[str],
+        *,
+        title: str = "",
+        final_keyboard: dict[str, Any] | None = None,
+    ) -> None:
+        pages: list[list[str]] = []
+        current: list[str] = []
+        current_length = len(title) + 32
+        for line in lines:
+            extra = len(line) + 1
+            if current and current_length + extra > 3500:
+                pages.append(current)
+                current = []
+                current_length = len(title) + 32
+            current.append(line)
+            current_length += extra
+        if current or not pages:
+            pages.append(current)
+        for page_number, page in enumerate(pages, start=1):
+            page_title = title
+            if title and len(pages) > 1:
+                page_title += f" ({page_number}/{len(pages)})"
+            prefix = f"{page_title}\n\n" if page_title else ""
+            keyboard = final_keyboard if page_number == len(pages) else None
+            self._send(
+                chat_id,
+                prefix + "\n".join(page),
+                keyboard=keyboard,
+            )
+
+    def _send_help(self, chat_id: int) -> None:
+        self._send(
+            chat_id,
+            "<b>Команды</b>\n\n"
+            "/lists — DNS-списки\n"
+            "/rules — правила DNS-маршрутизации\n"
+            "/routes — IPv4-маршруты\n"
+            "/interfaces — системные ID интерфейсов\n"
+            "/status — состояние подключения\n"
+            "/cancel — отменить ввод\n\n"
+            "Все изменения попадают в штатную конфигурацию Keenetic и видны "
+            "в веб-панели.",
+            keyboard=self._home_keyboard(),
+        )
+
+    @staticmethod
+    def _home_keyboard() -> dict[str, Any]:
+        return inline_keyboard(
+            [
+                [("🌐 DNS-списки", "groups"), ("🧭 Правила DNS", "rules")],
+                [("🌍 IPv4-маршруты", "routes")],
+                [("🔌 Интерфейсы", "interfaces"), ("ℹ️ Статус", "status")],
+            ]
+        )
+
+    @staticmethod
+    def _group_keyboard() -> dict[str, Any]:
+        return inline_keyboard(
+            [
+                [("📄 Показать", "g_show")],
+                [("➕ Добавить", "g_add"), ("➖ Удалить", "g_remove")],
+                [("🔗 Создать правило", "g_attach")],
+                [("🗑 Удалить список", "g_delete")],
+                [("← К спискам", "groups"), ("← Меню", "home")],
+            ]
+        )
+
+    @staticmethod
+    def _rule_keyboard(enabled: bool) -> dict[str, Any]:
+        return inline_keyboard(
+            [
+                [(("⏸ Выключить" if enabled else "▶️ Включить"), "r_toggle")],
+                [("🗑 Удалить правило", "r_delete")],
+                [("← К правилам", "rules"), ("← Меню", "home")],
+            ]
+        )
+
+    @staticmethod
+    def _routes_keyboard() -> dict[str, Any]:
+        return inline_keyboard([[("← К маршрутам", "routes")], [("← Меню", "home")]])
+
+    @staticmethod
+    def _ipv4_route_keyboard(enabled: bool) -> dict[str, Any]:
+        return inline_keyboard(
+            [
+                [(("⏸ Выключить" if enabled else "▶️ Включить"), "ip_toggle")],
+                [("🗑 Удалить маршрут", "ip_delete")],
+                [("← К маршрутам", "routes"), ("← Меню", "home")],
+            ]
+        )
+
+    def _rate_limit_ok(self, user_id: int) -> bool:
+        now = time.monotonic()
+        times = self.request_times[user_id]
+        while times and now - times[0] > 60:
+            times.popleft()
+        if len(times) >= 30:
+            return False
+        times.append(now)
+        return True
+
+    def _validate_group_size(self, entries: tuple[str, ...]) -> None:
+        if len(entries) > self.config.max_group_entries:
+            raise ValidationError(
+                f"В списке получилось {len(entries)} записей, а лимит "
+                f"настроен на {self.config.max_group_entries}. Разделите их "
+                "на несколько DNS-списков."
+            )
+
+
+def _chat_id(update: dict[str, Any]) -> int | None:
+    if "message" in update:
+        value = update["message"].get("chat", {}).get("id")
+    else:
+        value = (
+            update.get("callback_query", {})
+            .get("message", {})
+            .get("chat", {})
+            .get("id")
+        )
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
