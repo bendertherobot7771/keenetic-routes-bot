@@ -204,8 +204,10 @@ class KeeneticRciClient:
 
     def _write(self, queries: list[dict[str, Any]]) -> Any:
         payload = [
-            *queries,
-            {"path": "system.configuration.save", "data": {}},
+            *[_rci_query_to_object(query) for query in queries],
+            _rci_query_to_object(
+                {"path": "system.configuration.save", "data": {}}
+            ),
         ]
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         return self._request("POST", f"{self.base_url}/", body)
@@ -273,3 +275,18 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, dict):
         return list(value.values())
     return []
+
+
+def _rci_query_to_object(query: dict[str, Any]) -> dict[str, Any]:
+    """Convert a client-side RCI query into the native batch request shape.
+
+    The stock web UI sends ``{"object-group": {"fqdn": ...}}`` to the RCI
+    batch endpoint, rather than its internal ``{"path": "object-group.fqdn"}``
+    representation.
+    """
+    path = str(query["path"])
+    value = query.get("data", {})
+    result: Any = value
+    for part in reversed(path.split(".")):
+        result = {part: result}
+    return result

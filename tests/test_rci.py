@@ -83,22 +83,22 @@ class RciClientTests(unittest.TestCase):
             payload,
             [
                 {
-                    "path": "object-group.fqdn",
-                    "data": {"openai": {"include": {"no": True}}},
+                    "object-group": {"fqdn": {"openai": {"include": {"no": True}}}}
                 },
                 {
-                    "path": "object-group.fqdn",
-                    "data": {
-                        "openai": {
-                            "description": "openai",
-                            "include": [
-                                {"address": "openai.com"},
-                                {"address": "chatgpt.com"},
-                            ],
+                    "object-group": {
+                        "fqdn": {
+                            "openai": {
+                                "description": "openai",
+                                "include": [
+                                    {"address": "openai.com"},
+                                    {"address": "chatgpt.com"},
+                                ],
+                            }
                         }
-                    },
+                    }
                 },
-                {"path": "system.configuration.save", "data": {}},
+                {"system": {"configuration": {"save": {}}}},
             ],
         )
 
@@ -116,18 +116,20 @@ class RciClientTests(unittest.TestCase):
         self.assertEqual(
             payload[0],
             {
-                "path": "dns-proxy.route",
-                "data": {
+                "dns-proxy": {"route": {
                     "group": "openai",
                     "gateway": "",
                     "auto": True,
                     "reject": True,
                     "interface": "u1Host",
                     "disable": False,
-                },
+                }},
             },
         )
-        self.assertEqual(payload[-1], {"path": "system.configuration.save", "data": {}})
+        self.assertEqual(
+            payload[-1],
+            {"system": {"configuration": {"save": {}}}},
+        )
 
     def test_adds_ipv4_route_in_native_shape(self) -> None:
         self.client.add_ipv4_routes(
@@ -141,10 +143,13 @@ class RciClientTests(unittest.TestCase):
                 )
             ]
         )
-        data = self.transport.calls[-1][2][0]["data"]
+        data = self.transport.calls[-1][2][0]["ip"]["route"]
         self.assertEqual(data["network"], "31.13.64.0")
         self.assertEqual(data["mask"], "255.255.192.0")
         self.assertEqual(data["comment"], "instagram")
+        self.assertTrue(
+            all("path" not in item for item in self.transport.calls[-1][2])
+        )
 
     def test_raises_for_nested_rci_error(self) -> None:
         self.transport.get_responses["http://127.0.0.1:79/rci/show/version"] = {
