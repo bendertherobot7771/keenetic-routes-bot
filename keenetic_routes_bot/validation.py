@@ -155,6 +155,22 @@ def remove_entries(
     return remaining, missing
 
 
+def is_domain_entry(value: str) -> bool:
+    """Return whether a normalized FQDN-group entry is a domain name."""
+    try:
+        ipaddress.ip_network(value, strict=False)
+        return False
+    except ValueError:
+        return True
+
+
+def domain_covers(parent: str, candidate: str) -> bool:
+    """Return whether Keenetic's wildcard matching for parent covers candidate."""
+    parent = parent.casefold().rstrip(".")
+    candidate = candidate.casefold().rstrip(".")
+    return candidate == parent or candidate.endswith(f".{parent}")
+
+
 def _looks_like_network(value: str) -> bool:
     try:
         ipaddress.ip_network(value, strict=False)

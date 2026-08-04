@@ -108,9 +108,95 @@ class AppTests(unittest.TestCase):
         self.app.handle_update(self.callback_update("g:0"))
         self.app.handle_update(self.callback_update("g_add"))
         self.app.handle_update(self.message_update("chatgpt.com\nOPENAI.COM"))
+        self.assertFalse(self.router.saved_groups)
+        self.assertIn("уже есть", self.telegram.messages[-1][1])
+        self.app.handle_update(self.callback_update("g_add_yes"))
         saved = self.router.saved_groups[-1]
         self.assertEqual(saved.entries, ("openai.com", "chatgpt.com"))
         self.assertIn("Добавлено: 1", self.telegram.messages[-1][1])
+
+    def test_warns_when_parent_domain_already_exists_and_can_cancel(self) -> None:
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_add"))
+        self.app.handle_update(self.message_update("api.openai.com"))
+
+        text = self.telegram.messages[-1][1]
+        self.assertIn("api.openai.com", text)
+        self.assertIn("openai.com", text)
+        self.assertFalse(self.router.saved_groups)
+
+        self.app.handle_update(self.callback_update("g_add_cancel"))
+        self.assertFalse(self.router.saved_groups)
+        self.assertIn("Добавление отменено", self.telegram.messages[-1][1])
+
+    def test_warns_when_new_parent_covers_an_existing_subdomain(self) -> None:
+        self.router.groups = [FqdnGroup("search", "Search", ("search.yandex.ru",))]
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_add"))
+        self.app.handle_update(self.message_update("yandex.ru"))
+
+        text = self.telegram.messages[-1][1]
+        self.assertIn("yandex.ru", text)
+        self.assertIn("покрывает", text)
+        self.assertFalse(self.router.saved_groups)
+
+    def test_warns_before_creating_group_with_covered_domain(self) -> None:
+        self.app.handle_update(self.callback_update("group_new"))
+        self.app.handle_update(self.message_update("AI subdomains"))
+        self.app.handle_update(self.message_update("api.openai.com"))
+
+        self.assertIn("уже есть", self.telegram.messages[-1][1])
+        self.assertIsNone(self.router.get_group("AI subdomains"))
+
+        self.app.handle_update(self.callback_update("g_create_yes"))
+        created = self.router.get_group("AI subdomains")
+        self.assertIsNotNone(created)
+        self.assertEqual(created.entries, ("api.openai.com",))
+
+    def test_deduplicates_domains_across_all_groups(self) -> None:
+        self.router.groups = [
+            FqdnGroup(
+                "first",
+                "First",
+                ("search.yandex.ru", "192.0.2.0/24"),
+            ),
+            FqdnGroup(
+                "second",
+                "Second",
+                ("yandex.ru", "openai.com"),
+            ),
+            FqdnGroup(
+                "third",
+                "Third",
+                ("openai.com", "mail.yandex.ru", "192.0.2.0/24"),
+            ),
+        ]
+
+        self.app.handle_update(self.callback_update("groups_dedupe"))
+        self.assertIn("избыточных доменов: <b>3</b>", self.telegram.messages[-1][1])
+        self.assertFalse(self.router.saved_groups)
+
+        self.app.handle_update(self.callback_update("groups_dedupe_yes"))
+        self.assertEqual(
+            self.router.get_group("first").entries,
+            ("192.0.2.0/24",),
+        )
+        self.assertEqual(
+            self.router.get_group("second").entries,
+            ("yandex.ru", "openai.com"),
+        )
+        self.assertEqual(
+            self.router.get_group("third").entries,
+            ("192.0.2.0/24",),
+        )
+        self.assertIn("Удалено избыточных доменов: 3", self.telegram.messages[-1][1])
+
+    def test_deduplicate_reports_when_nothing_to_remove(self) -> None:
+        self.app.handle_update(self.callback_update("groups_dedupe"))
+        self.assertIn("не найдены", self.telegram.messages[-1][1])
+        self.assertFalse(self.router.saved_groups)
 
     def test_refuses_group_delete_when_rule_uses_it(self) -> None:
         self.router.rules = [DnsRoute("1", "openai", interface="u1Host", auto=True)]
@@ -137,6 +223,10 @@ class AppTests(unittest.TestCase):
         self.assertEqual(
             keyboard["inline_keyboard"][0][0]["text"],
             "🌐 Мой настоящий список · 1",
+        )
+        self.assertEqual(
+            keyboard["inline_keyboard"][-2][0]["text"],
+            "🧹 Убрать дубликаты",
         )
 
 

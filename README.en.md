@@ -21,6 +21,8 @@ remain visible in the web UI and are saved through the standard
 
 - View, create, populate, and delete FQDN lists.
 - Add domains, IP addresses, and CIDRs in bulk, one per line.
+- Warn when a domain already exists or is covered by a wildcard parent domain.
+- Remove exact duplicates and redundant subdomains across all FQDN lists.
 - Show the real list names configured in the Keenetic web UI.
 - Show the number of DNS lists and their total number of entries.
 - Create, enable, disable, and delete native DNS routing rules.
@@ -186,6 +188,23 @@ api.example.com
 `*.example.com` is normalized to `example.com`; Keenetic includes subdomains
 automatically. URLs such as `https://example.com/page` are intentionally
 rejected.
+
+Before adding entries, the bot checks every FQDN list. If a domain already
+exists, is covered by an existing parent domain, or would itself cover an
+existing subdomain, the bot shows the conflicts and asks whether to continue or
+cancel the operation.
+
+The **Remove duplicates** button in the DNS lists section scans every list. It
+shows how many entries would be removed before asking for confirmation. The
+cleanup:
+
+- keeps the first occurrence of an exact duplicate;
+- removes a subdomain when a covering parent domain exists in any list;
+- leaves IP addresses and CIDRs unchanged.
+
+For example, when `yandex.ru` exists, `search.yandex.ru` and `mail.yandex.ru`
+are redundant because Keenetic routing for `yandex.ru` already applies to all
+of its subdomains.
 
 ### IPv4 routes
 

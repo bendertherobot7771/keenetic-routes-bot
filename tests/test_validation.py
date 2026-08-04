@@ -4,6 +4,8 @@ import unittest
 
 from keenetic_routes_bot.validation import (
     ValidationError,
+    domain_covers,
+    is_domain_entry,
     normalize_entry,
     normalize_group_name,
     parse_entries,
@@ -60,6 +62,18 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertEqual(remaining, ("a.example",))
         self.assertEqual(missing, ("c.example",))
+
+    def test_detects_domain_wildcard_coverage(self) -> None:
+        self.assertTrue(domain_covers("yandex.ru", "search.yandex.ru"))
+        self.assertTrue(domain_covers("YANDEX.RU", "yandex.ru"))
+        self.assertFalse(domain_covers("notyandex.ru", "yandex.ru"))
+        self.assertFalse(domain_covers("search.yandex.ru", "yandex.ru"))
+
+    def test_distinguishes_domains_from_ip_entries(self) -> None:
+        self.assertTrue(is_domain_entry("example.com"))
+        self.assertFalse(is_domain_entry("192.0.2.1"))
+        self.assertFalse(is_domain_entry("192.0.2.0/24"))
+        self.assertFalse(is_domain_entry("2001:db8::/32"))
 
 
 if __name__ == "__main__":

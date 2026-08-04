@@ -14,6 +14,8 @@ from .rci import KeeneticRciClient, RciError
 from .telegram import TelegramClient, TelegramError, inline_keyboard
 from .validation import (
     ValidationError,
+    domain_covers,
+    is_domain_entry,
     merge_entries,
     normalize_group_name,
     normalize_interface,
@@ -188,6 +190,10 @@ class BotApp:
                     chat_id,
                     "Введите имя нового списка (до 64 символов).\n\n/cancel — отмена",
                 )
+            elif callback_data == "groups_dedupe":
+                self._prepare_groups_deduplicate(user_id, chat_id)
+            elif callback_data == "groups_dedupe_yes":
+                self._confirm_groups_deduplicate(user_id, chat_id)
             elif callback_data.startswith("g:"):
                 self._select_group(
                     user_id, chat_id, int(callback_data.split(":", 1)[1])
@@ -200,6 +206,21 @@ class BotApp:
                     chat_id,
                     "Отправьте домены, IP-адреса или CIDR — по одному в строке.\n"
                     "Поддомены учитываются автоматически; <code>*.</code> не нужен.",
+                )
+            elif callback_data == "g_add_yes":
+                self._confirm_group_add(user_id, chat_id)
+            elif callback_data == "g_add_cancel":
+                self._cancel_group_add(user_id, chat_id)
+            elif callback_data == "g_create_yes":
+                self._confirm_group_create(user_id, chat_id)
+            elif callback_data == "g_create_cancel":
+                self.sessions[user_id].clear()
+                self._send(
+                    chat_id,
+                    "Создание списка отменено.",
+                    keyboard=inline_keyboard(
+                        [[("DNS-списки", "groups")], [("← Меню", "home")]]
+                    ),
                 )
             elif callback_data == "g_remove":
                 self.sessions[user_id]["action"] = "remove_group_entries"
@@ -303,6 +324,25 @@ class BotApp:
         name = str(self.sessions[user_id]["pending_group"])
         entries = parse_entries(text)
         self._validate_group_size(entries)
+        conflicts = self._find_domain_conflicts(entries)
+        if conflicts:
+            self.sessions[user_id].update({"action": "", "pending_entries": entries})
+            self._send_domain_conflict_warning(
+                chat_id,
+                conflicts,
+                confirm_callback="g_create_yes",
+                cancel_callback="g_create_cancel",
+            )
+            return
+        self._create_group(user_id, chat_id, name, entries)
+
+    def _create_group(
+        self,
+        user_id: int,
+        chat_id: int,
+        name: str,
+        entries: tuple[str, ...],
+    ) -> None:
         self.router.save_group(
             FqdnGroup(name=name, description=name, entries=entries),
             replace=False,
@@ -320,9 +360,39 @@ class BotApp:
             keyboard=self._group_keyboard(),
         )
 
+    def _confirm_group_create(self, user_id: int, chat_id: int) -> None:
+        name = str(self.sessions[user_id].get("pending_group", ""))
+        entries = tuple(self.sessions[user_id].get("pending_entries", ()))
+        if not name or not entries:
+            raise ValidationError("Подтверждение устарело.")
+        if self.router.get_group(name) is not None:
+            raise ValidationError("Список с таким именем уже существует.")
+        self._create_group(user_id, chat_id, name, entries)
+
     def _state_add_group_entries(self, user_id: int, chat_id: int, text: str) -> None:
         group = self._current_group(user_id)
         additions = parse_entries(text)
+        conflicts = self._find_domain_conflicts(additions)
+        if conflicts:
+            self.sessions[user_id].update(
+                {"action": "", "pending_additions": additions}
+            )
+            self._send_domain_conflict_warning(
+                chat_id,
+                conflicts,
+                confirm_callback="g_add_yes",
+                cancel_callback="g_add_cancel",
+            )
+            return
+        self._add_group_entries(user_id, chat_id, group, additions)
+
+    def _add_group_entries(
+        self,
+        user_id: int,
+        chat_id: int,
+        group: FqdnGroup,
+        additions: tuple[str, ...],
+    ) -> None:
         entries = merge_entries(group.entries, additions)
         self._validate_group_size(entries)
         added_count = len(entries) - len(group.entries)
@@ -337,6 +407,23 @@ class BotApp:
         self._send(
             chat_id,
             f"✅ Добавлено: {added_count}. Всего: {len(entries)}.",
+            keyboard=self._group_keyboard(),
+        )
+
+    def _confirm_group_add(self, user_id: int, chat_id: int) -> None:
+        additions = tuple(self.sessions[user_id].get("pending_additions", ()))
+        if not additions:
+            raise ValidationError("Подтверждение устарело.")
+        self._add_group_entries(
+            user_id, chat_id, self._current_group(user_id), additions
+        )
+
+    def _cancel_group_add(self, user_id: int, chat_id: int) -> None:
+        group = self._current_group(user_id)
+        self.sessions[user_id] = {"current_group": group.name}
+        self._send(
+            chat_id,
+            "Добавление отменено.",
             keyboard=self._group_keyboard(),
         )
 
@@ -498,11 +585,69 @@ class BotApp:
                     )
                 ]
             )
-        rows.extend([[("➕ Новый список", "group_new")], [("← Меню", "home")]])
+        rows.extend(
+            [
+                [("➕ Новый список", "group_new")],
+                [("🧹 Убрать дубликаты", "groups_dedupe")],
+                [("← Меню", "home")],
+            ]
+        )
         self._send(
             chat_id,
             f"<b>DNS-списки</b>\n\nВсего: {len(groups)}",
             keyboard=inline_keyboard(rows),
+        )
+
+    def _prepare_groups_deduplicate(self, user_id: int, chat_id: int) -> None:
+        updates, removed = self._deduplicate_groups(self.router.list_groups())
+        if not removed:
+            self._send(
+                chat_id,
+                "✅ Дубликаты и избыточные поддомены не найдены.",
+                keyboard=inline_keyboard(
+                    [[("← К спискам", "groups")], [("← Меню", "home")]]
+                ),
+            )
+            return
+        self.sessions[user_id] = {"confirm_groups_deduplicate": True}
+        preview = "\n".join(
+            f"• <code>{html.escape(entry)}</code> — {html.escape(group_name)}"
+            for group_name, entry in removed[:10]
+        )
+        suffix = f"\n…ещё {len(removed) - 10}" if len(removed) > 10 else ""
+        self._send(
+            chat_id,
+            f"Найдено избыточных доменов: <b>{len(removed)}</b> "
+            f"в {len(updates)} списках.\n\n{preview}{suffix}\n\n"
+            "Удалить их? IP-адреса и CIDR не изменятся.",
+            keyboard=inline_keyboard(
+                [
+                    [("🧹 Да, убрать", "groups_dedupe_yes")],
+                    [("Отмена", "groups")],
+                ]
+            ),
+        )
+
+    def _confirm_groups_deduplicate(self, user_id: int, chat_id: int) -> None:
+        if not self.sessions[user_id].get("confirm_groups_deduplicate"):
+            raise ValidationError("Подтверждение устарело.")
+        updates, removed = self._deduplicate_groups(self.router.list_groups())
+        for group in updates:
+            self.router.save_group(group)
+        self.sessions[user_id].clear()
+        self.logger.info(
+            "Telegram user_id=%s deduplicated FQDN groups changed=%s removed=%s",
+            user_id,
+            len(updates),
+            len(removed),
+        )
+        self._send(
+            chat_id,
+            f"✅ Удалено избыточных доменов: {len(removed)}. "
+            f"Обновлено списков: {len(updates)}.",
+            keyboard=inline_keyboard(
+                [[("DNS-списки", "groups")], [("← Меню", "home")]]
+            ),
         )
 
     def _select_group(self, user_id: int, chat_id: int, index: int) -> None:
@@ -855,6 +1000,7 @@ class BotApp:
             [
                 [("📄 Показать", "g_show")],
                 [("➕ Добавить", "g_add"), ("➖ Удалить", "g_remove")],
+                [("🧹 Убрать дубликаты", "groups_dedupe")],
                 [("🔗 Создать правило", "g_attach")],
                 [("🗑 Удалить список", "g_delete")],
                 [("← К спискам", "groups"), ("← Меню", "home")],
@@ -884,6 +1030,98 @@ class BotApp:
                 [("← К маршрутам", "routes"), ("← Меню", "home")],
             ]
         )
+
+    def _find_domain_conflicts(
+        self, additions: tuple[str, ...]
+    ) -> list[tuple[str, str, str, str]]:
+        conflicts: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        groups = self.router.list_groups()
+        for addition in additions:
+            if not is_domain_entry(addition):
+                continue
+            for group in groups:
+                display_name = group.description or group.name
+                for existing in group.entries:
+                    if not is_domain_entry(existing):
+                        continue
+                    if domain_covers(existing, addition):
+                        relation = "covered"
+                    elif domain_covers(addition, existing):
+                        relation = "covers"
+                    else:
+                        continue
+                    key = (addition, existing, group.name)
+                    if key not in seen:
+                        conflicts.append((addition, existing, display_name, relation))
+                        seen.add(key)
+        return conflicts
+
+    def _send_domain_conflict_warning(
+        self,
+        chat_id: int,
+        conflicts: list[tuple[str, str, str, str]],
+        *,
+        confirm_callback: str,
+        cancel_callback: str,
+    ) -> None:
+        lines: list[str] = []
+        for addition, existing, group_name, relation in conflicts[:10]:
+            action = "уже покрывается" if relation == "covered" else "покрывает"
+            lines.append(
+                f"• <code>{html.escape(addition)}</code> {action} "
+                f"<code>{html.escape(existing)}</code> "
+                f"(список «{html.escape(group_name)}»)"
+            )
+        suffix = (
+            f"\n…ещё совпадений: {len(conflicts) - 10}" if len(conflicts) > 10 else ""
+        )
+        self._send(
+            chat_id,
+            "⚠️ Похожие домены уже есть в DNS-списках:\n\n"
+            + "\n".join(lines)
+            + suffix
+            + "\n\nДобавлять записи всё равно?",
+            keyboard=inline_keyboard(
+                [
+                    [("Продолжить", confirm_callback)],
+                    [("Отменить", cancel_callback)],
+                ]
+            ),
+        )
+
+    @staticmethod
+    def _deduplicate_groups(
+        groups: list[FqdnGroup],
+    ) -> tuple[list[FqdnGroup], list[tuple[str, str]]]:
+        all_domains = [
+            entry.casefold().rstrip(".")
+            for group in groups
+            for entry in group.entries
+            if is_domain_entry(entry)
+        ]
+        seen: set[str] = set()
+        updates: list[FqdnGroup] = []
+        removed: list[tuple[str, str]] = []
+        for group in groups:
+            kept: list[str] = []
+            for entry in group.entries:
+                redundant = False
+                if is_domain_entry(entry):
+                    entry_key = entry.casefold().rstrip(".")
+                    redundant = entry_key in seen or any(
+                        parent != entry_key and domain_covers(parent, entry_key)
+                        for parent in all_domains
+                    )
+                    if not redundant:
+                        seen.add(entry_key)
+                if redundant:
+                    removed.append((group.description or group.name, entry))
+                else:
+                    kept.append(entry)
+            if tuple(kept) != group.entries:
+                updates.append(replace(group, entries=tuple(kept)))
+        return updates, removed
 
     def _rate_limit_ok(self, user_id: int) -> bool:
         now = time.monotonic()
