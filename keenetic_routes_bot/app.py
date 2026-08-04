@@ -194,6 +194,12 @@ class BotApp:
                 self._prepare_groups_deduplicate(user_id, chat_id)
             elif callback_data == "groups_dedupe_yes":
                 self._confirm_groups_deduplicate(user_id, chat_id)
+            elif callback_data == "groups_remove":
+                self.sessions[user_id] = {"action": "remove_entries_global"}
+                self._send(
+                    chat_id,
+                    self._bulk_entries_prompt("remove", domains_only=True),
+                )
             elif callback_data.startswith("g:"):
                 self._select_group(
                     user_id, chat_id, int(callback_data.split(":", 1)[1])
@@ -204,8 +210,7 @@ class BotApp:
                 self.sessions[user_id]["action"] = "add_group_entries"
                 self._send(
                     chat_id,
-                    "Отправьте домены, IP-адреса или CIDR — по одному в строке.\n"
-                    "Поддомены учитываются автоматически; <code>*.</code> не нужен.",
+                    self._bulk_entries_prompt("add"),
                 )
             elif callback_data == "g_add_yes":
                 self._confirm_group_add(user_id, chat_id)
@@ -226,7 +231,7 @@ class BotApp:
                 self.sessions[user_id]["action"] = "remove_group_entries"
                 self._send(
                     chat_id,
-                    "Отправьте записи для удаления — по одной в строке.",
+                    self._bulk_entries_prompt("remove"),
                 )
             elif callback_data == "g_attach":
                 self.sessions[user_id]["action"] = "attach_group"
@@ -314,8 +319,7 @@ class BotApp:
         }
         self._send(
             chat_id,
-            f"Список <b>{html.escape(name)}</b>.\n"
-            "Теперь отправьте домены, IP-адреса или CIDR — по одному в строке.",
+            f"Список <b>{html.escape(name)}</b>.\n" + self._bulk_entries_prompt("add"),
         )
 
     def _state_create_group_entries(
@@ -449,6 +453,72 @@ class BotApp:
             chat_id,
             f"✅ Удалено: {removed_count}. Осталось: {len(entries)}.{suffix}",
             keyboard=self._group_keyboard(),
+        )
+
+    def _state_remove_entries_global(
+        self, user_id: int, chat_id: int, text: str
+    ) -> None:
+        removals = parse_entries(text)
+        non_domains = tuple(entry for entry in removals if not is_domain_entry(entry))
+        if non_domains:
+            raise ValidationError(
+                "Для глобального удаления укажите только доменные имена."
+            )
+        removal_keys = {entry.casefold().rstrip(".") for entry in removals}
+        removed_by_group: list[tuple[str, tuple[str, ...]]] = []
+        found_keys: set[str] = set()
+        for group in self.router.list_groups():
+            matched = tuple(
+                entry
+                for entry in group.entries
+                if is_domain_entry(entry)
+                and entry.casefold().rstrip(".") in removal_keys
+            )
+            if not matched:
+                continue
+            matched_keys = {entry.casefold().rstrip(".") for entry in matched}
+            remaining = tuple(
+                entry
+                for entry in group.entries
+                if entry.casefold().rstrip(".") not in matched_keys
+            )
+            self.router.save_group(replace(group, entries=remaining))
+            removed_by_group.append((group.description or group.name, matched))
+            found_keys.update(matched_keys)
+        if not removed_by_group:
+            raise ValidationError("Указанные домены не найдены ни в одном DNS-списке.")
+        missing = tuple(
+            entry
+            for entry in removals
+            if entry.casefold().rstrip(".") not in found_keys
+        )
+        removed_count = sum(len(entries) for _, entries in removed_by_group)
+        lines: list[str] = []
+        for group_name, entries in removed_by_group:
+            lines.append(f"<b>{html.escape(group_name)}</b>")
+            lines.extend(f"• <code>{html.escape(entry)}</code>" for entry in entries)
+            lines.append("")
+        if missing:
+            lines.append("<b>Не найдены</b>")
+            lines.extend(f"• <code>{html.escape(entry)}</code>" for entry in missing)
+        self.sessions[user_id].clear()
+        self.logger.info(
+            "Telegram user_id=%s globally removed FQDN entries groups=%s count=%s missing=%s",
+            user_id,
+            len(removed_by_group),
+            removed_count,
+            len(missing),
+        )
+        self._send_paginated_lines(
+            chat_id,
+            lines,
+            title=(
+                f"✅ Удалено доменов: <b>{removed_count}</b> "
+                f"из списков: <b>{len(removed_by_group)}</b>"
+            ),
+            final_keyboard=inline_keyboard(
+                [[("DNS-списки", "groups")], [("← Меню", "home")]]
+            ),
         )
 
     def _state_attach_group(self, user_id: int, chat_id: int, text: str) -> None:
@@ -588,6 +658,7 @@ class BotApp:
         rows.extend(
             [
                 [("➕ Новый список", "group_new")],
+                [("🗑 Удалить домены из списков", "groups_remove")],
                 [("🧹 Убрать дубликаты", "groups_dedupe")],
                 [("← Меню", "home")],
             ]
@@ -979,9 +1050,36 @@ class BotApp:
             "/interfaces — системные ID интерфейсов\n"
             "/status — состояние подключения\n"
             "/cancel — отменить ввод\n\n"
+            "Домены можно отправлять пачкой: столбиком, через пробел, "
+            "запятую или <code>;</code>.\n\n"
             "Все изменения попадают в штатную конфигурацию Keenetic и видны "
             "в веб-панели.",
             keyboard=self._home_keyboard(),
+        )
+
+    @staticmethod
+    def _bulk_entries_prompt(action: str, *, domains_only: bool = False) -> str:
+        operation = "добавления" if action == "add" else "удаления"
+        entries = "домены" if domains_only else "домены, IP-адреса или CIDR"
+        wildcard_hint = (
+            "\nПоддомены учитываются автоматически; <code>*.</code> не нужен."
+            if action == "add"
+            else ""
+        )
+        return (
+            f"Отправьте {entries} для {operation}. Можно вставить сразу несколько:\n"
+            "• столбиком;\n"
+            "• через пробел, запятую или <code>;</code>.\n\n"
+            "Например, столбиком:\n"
+            "<code>ya.ru\n"
+            "yandex.ru\n"
+            "yandex.com\n"
+            "yandex.by\n"
+            "yandex.kz\n"
+            "yandex.com.tr</code>\n\n"
+            "Или одной строкой:\n"
+            "<code>ya.ru yandex.ru yandex.com</code>"
+            f"{wildcard_hint}\n\n/cancel — отмена"
         )
 
     @staticmethod
@@ -998,8 +1096,11 @@ class BotApp:
     def _group_keyboard() -> dict[str, Any]:
         return inline_keyboard(
             [
-                [("📄 Показать", "g_show")],
-                [("➕ Добавить", "g_add"), ("➖ Удалить", "g_remove")],
+                [("📄 Показать домены", "g_show")],
+                [
+                    ("➕ Добавить домен", "g_add"),
+                    ("➖ Удалить домен", "g_remove"),
+                ],
                 [("🧹 Убрать дубликаты", "groups_dedupe")],
                 [("🔗 Создать правило", "g_attach")],
                 [("🗑 Удалить список", "g_delete")],

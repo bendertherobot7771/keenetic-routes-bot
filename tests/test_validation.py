@@ -31,12 +31,37 @@ class ValidationTests(unittest.TestCase):
         entries = parse_entries(
             """
             # comment
-            example.com
+            example.com api.example.com
             EXAMPLE.COM;
-            192.0.2.0/24, api.example.com
+            192.0.2.0/24,cdn.example.com; static.example.com
             """
         )
-        self.assertEqual(entries, ("example.com", "192.0.2.0/24", "api.example.com"))
+        self.assertEqual(
+            entries,
+            (
+                "example.com",
+                "api.example.com",
+                "192.0.2.0/24",
+                "cdn.example.com",
+                "static.example.com",
+            ),
+        )
+
+    def test_parse_entries_accepts_vertical_and_space_separated_domains(self) -> None:
+        entries = parse_entries(
+            "ya.ru\nyandex.ru\nyandex.com yandex.by yandex.kz yandex.com.tr"
+        )
+        self.assertEqual(
+            entries,
+            (
+                "ya.ru",
+                "yandex.ru",
+                "yandex.com",
+                "yandex.by",
+                "yandex.kz",
+                "yandex.com.tr",
+            ),
+        )
 
     def test_group_name_limits(self) -> None:
         self.assertEqual(normalize_group_name("  My   routes  "), "My routes")

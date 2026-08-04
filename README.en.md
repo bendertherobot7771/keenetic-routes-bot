@@ -20,7 +20,9 @@ remain visible in the web UI and are saved through the standard
 ## Features
 
 - View, create, populate, and delete FQDN lists.
-- Add domains, IP addresses, and CIDRs in bulk, one per line.
+- Add and remove domains, IP addresses, and CIDRs in bulk: one per line or
+  separated by spaces, commas, or `;`.
+- Find and remove requested domains across every FQDN list with a per-list report.
 - Warn when a domain already exists or is covered by a wildcard parent domain.
 - Remove exact duplicates and redundant subdomains across all FQDN lists.
 - Show the real list names configured in the Keenetic web UI.
@@ -176,14 +178,25 @@ is never written to the log.
 
 ### Domains and addresses
 
-Send one entry per line:
+For adding or removing entries, multiple values may be sent vertically:
 
 ```text
-example.com
-api.example.com
-192.0.2.0/24
-2001:db8::/32
+ya.ru
+yandex.ru
+yandex.com
+yandex.by
+yandex.kz
+yandex.com.tr
 ```
+
+They may also be sent on one line, separated by spaces, commas, or `;`:
+
+```text
+ya.ru yandex.ru yandex.com
+```
+
+These formats work when creating a list, adding domains, and removing domains
+from a selected list. The bot displays examples before asking for input.
 
 `*.example.com` is normalized to `example.com`; Keenetic includes subdomains
 automatically. URLs such as `https://example.com/page` are intentionally
@@ -205,6 +218,16 @@ cleanup:
 For example, when `yandex.ru` exists, `search.yandex.ru` and `mail.yandex.ru`
 are redundant because Keenetic routing for `yandex.ru` already applies to all
 of its subdomains.
+
+The **Remove domains from lists** button accepts a batch in the same formats,
+searches every FQDN list, and removes every exact match. Its result reports:
+
+- the real name of every modified list;
+- the domains removed from that list;
+- requested domains that were not found anywhere.
+
+Global removal accepts domain names only and does not modify IP addresses or
+CIDRs.
 
 ### IPv4 routes
 

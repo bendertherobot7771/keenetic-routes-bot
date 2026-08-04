@@ -70,11 +70,13 @@ def normalize_entry(value: str) -> str:
 
 def parse_entries(text: str) -> tuple[str, ...]:
     raw_entries: list[str] = []
-    for line in text.replace(";", "\n").replace(",", "\n").splitlines():
-        candidate = line.strip()
-        if not candidate or candidate.startswith("#"):
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
-        raw_entries.append(candidate)
+        raw_entries.extend(
+            candidate for candidate in re.split(r"[\s,;]+", line) if candidate
+        )
     if not raw_entries:
         raise ValidationError("Не найдено ни одной записи.")
     normalized: list[str] = []

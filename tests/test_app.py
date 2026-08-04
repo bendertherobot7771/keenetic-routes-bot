@@ -130,6 +130,74 @@ class AppTests(unittest.TestCase):
         self.assertFalse(self.router.saved_groups)
         self.assertIn("Добавление отменено", self.telegram.messages[-1][1])
 
+    def test_add_prompt_explains_bulk_input_formats(self) -> None:
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_add"))
+
+        text = self.telegram.messages[-1][1]
+        self.assertIn("столбиком", text)
+        self.assertIn("через пробел", text)
+        self.assertIn("ya.ru yandex.ru yandex.com", text)
+
+    def test_removes_multiple_entries_from_selected_group(self) -> None:
+        self.router.groups = [
+            FqdnGroup(
+                "yandex",
+                "Yandex",
+                ("ya.ru", "yandex.ru", "yandex.com", "keep.example"),
+            )
+        ]
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_remove"))
+        self.app.handle_update(self.message_update("ya.ru yandex.ru\nyandex.com"))
+
+        self.assertEqual(
+            self.router.get_group("yandex").entries,
+            ("keep.example",),
+        )
+        self.assertIn("Удалено: 3", self.telegram.messages[-1][1])
+
+    def test_globally_removes_domains_and_reports_each_list(self) -> None:
+        self.router.groups = [
+            FqdnGroup(
+                "first",
+                "First list",
+                ("ya.ru", "yandex.ru", "keep.example"),
+            ),
+            FqdnGroup(
+                "second",
+                "Second list",
+                ("yandex.com", "ya.ru", "192.0.2.0/24"),
+            ),
+        ]
+        self.app.handle_update(self.callback_update("groups_remove"))
+        self.assertIn("через пробел", self.telegram.messages[-1][1])
+        self.app.handle_update(
+            self.message_update("ya.ru yandex.ru\nyandex.com missing.example")
+        )
+
+        self.assertEqual(
+            self.router.get_group("first").entries,
+            ("keep.example",),
+        )
+        self.assertEqual(
+            self.router.get_group("second").entries,
+            ("192.0.2.0/24",),
+        )
+        text = self.telegram.messages[-1][1]
+        self.assertIn("Удалено доменов: <b>4</b>", text)
+        self.assertIn("First list", text)
+        self.assertIn("Second list", text)
+        self.assertIn("missing.example", text)
+
+    def test_global_remove_rejects_ip_entries(self) -> None:
+        self.app.handle_update(self.callback_update("groups_remove"))
+        self.app.handle_update(self.message_update("192.0.2.1"))
+        self.assertIn("только доменные имена", self.telegram.messages[-1][1])
+        self.assertFalse(self.router.saved_groups)
+
     def test_warns_when_new_parent_covers_an_existing_subdomain(self) -> None:
         self.router.groups = [FqdnGroup("search", "Search", ("search.yandex.ru",))]
         self.app.handle_update(self.callback_update("groups"))
@@ -228,6 +296,16 @@ class AppTests(unittest.TestCase):
             keyboard["inline_keyboard"][-2][0]["text"],
             "🧹 Убрать дубликаты",
         )
+        self.assertEqual(
+            keyboard["inline_keyboard"][-3][0]["text"],
+            "🗑 Удалить домены из списков",
+        )
+
+    def test_group_domain_buttons_have_explicit_labels(self) -> None:
+        keyboard = self.app._group_keyboard()["inline_keyboard"]
+        self.assertEqual(keyboard[0][0]["text"], "📄 Показать домены")
+        self.assertEqual(keyboard[1][0]["text"], "➕ Добавить домен")
+        self.assertEqual(keyboard[1][1]["text"], "➖ Удалить домен")
 
 
 if __name__ == "__main__":
