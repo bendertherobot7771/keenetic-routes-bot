@@ -198,6 +198,68 @@ class AppTests(unittest.TestCase):
         self.assertIn("только доменные имена", self.telegram.messages[-1][1])
         self.assertFalse(self.router.saved_groups)
 
+    def test_partial_domain_search_finds_entries_and_linked_rules(self) -> None:
+        self.router.groups = [
+            FqdnGroup(
+                "yandex-main",
+                "Yandex main",
+                ("ya.ru", "yandex.ru", "example.com"),
+            ),
+            FqdnGroup("yandex-global", "Yandex global", ("yandex.com",)),
+        ]
+        self.router.rules = [
+            DnsRoute("1", "yandex-main", interface="u1Host", enabled=True),
+            DnsRoute(
+                "2",
+                "yandex-global",
+                interface="Wireguard0",
+                reject=True,
+                enabled=False,
+            ),
+        ]
+
+        self.app.handle_update(self.callback_update("groups_search"))
+        self.app.handle_update(self.message_update("ya"))
+        choice_text = self.telegram.messages[-1][1]
+        choice_keyboard = self.telegram.messages[-1][2]
+        self.assertIn("Как искать", choice_text)
+        self.assertEqual(
+            choice_keyboard["inline_keyboard"][1][0]["text"],
+            "🔎 Частичное совпадение",
+        )
+
+        self.app.handle_update(self.callback_update("groups_search_partial"))
+        text = self.telegram.messages[-1][1]
+        self.assertIn("Найдено: 3", text)
+        self.assertIn("ya.ru", text)
+        self.assertIn("yandex.ru", text)
+        self.assertIn("yandex.com", text)
+        self.assertIn("Yandex main", text)
+        self.assertIn("u1Host", text)
+        self.assertIn("Wireguard0", text)
+        self.assertIn("exclusive", text)
+
+    def test_exact_domain_search_returns_only_identical_domain(self) -> None:
+        self.router.groups = [
+            FqdnGroup("yandex", "Yandex", ("ya.ru", "yandex.ru", "notya.ru"))
+        ]
+        self.app.handle_update(self.callback_update("groups_search"))
+        self.app.handle_update(self.message_update("YA.RU."))
+        self.app.handle_update(self.callback_update("groups_search_exact"))
+
+        text = self.telegram.messages[-1][1]
+        self.assertIn("Найдено: 1", text)
+        self.assertIn("<code>ya.ru</code>", text)
+        self.assertNotIn("yandex.ru", text)
+        self.assertNotIn("notya.ru", text)
+        self.assertIn("Правила: нет", text)
+
+    def test_domain_search_reports_no_matches(self) -> None:
+        self.app.handle_update(self.callback_update("groups_search"))
+        self.app.handle_update(self.message_update("missing"))
+        self.app.handle_update(self.callback_update("groups_search_partial"))
+        self.assertIn("ничего не найдено", self.telegram.messages[-1][1])
+
     def test_warns_when_new_parent_covers_an_existing_subdomain(self) -> None:
         self.router.groups = [FqdnGroup("search", "Search", ("search.yandex.ru",))]
         self.app.handle_update(self.callback_update("groups"))
@@ -299,6 +361,10 @@ class AppTests(unittest.TestCase):
         self.assertEqual(
             keyboard["inline_keyboard"][-3][0]["text"],
             "🗑 Удалить домены из списков",
+        )
+        self.assertEqual(
+            keyboard["inline_keyboard"][-4][0]["text"],
+            "🔎 Найти правило по домену",
         )
 
     def test_group_domain_buttons_have_explicit_labels(self) -> None:

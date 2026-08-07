@@ -23,6 +23,7 @@ remain visible in the web UI and are saved through the standard
 - Add and remove domains, IP addresses, and CIDRs in bulk: one per line or
   separated by spaces, commas, or `;`.
 - Find and remove requested domains across every FQDN list with a per-list report.
+- Search DNS rules by a full domain or fragment using exact or partial matching.
 - Warn when a domain already exists or is covered by a wildcard parent domain.
 - Remove exact duplicates and redundant subdomains across all FQDN lists.
 - Show the real list names configured in the Keenetic web UI.
@@ -228,6 +229,16 @@ searches every FQDN list, and removes every exact match. Its result reports:
 
 Global removal accepts domain names only and does not modify IP addresses or
 CIDRs.
+
+The **Find rule by domain** button accepts a full domain or a fragment and then
+offers two search modes:
+
+- **exact match** — `ya.ru` finds only the `ya.ru` entry;
+- **partial match** — `ya` may find `ya.ru`, `yandex.ru`, and `yandex.com`.
+
+Each result includes the matched domain, the real FQDN list name, and linked DNS
+routing rules with their state, interface or gateway, and `exclusive` flag. The
+result also indicates when a list does not have a routing rule yet.
 
 ### IPv4 routes
 

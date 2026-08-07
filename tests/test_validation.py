@@ -6,6 +6,7 @@ from keenetic_routes_bot.validation import (
     ValidationError,
     domain_covers,
     is_domain_entry,
+    normalize_domain_search_query,
     normalize_entry,
     normalize_group_name,
     parse_entries,
@@ -99,6 +100,13 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(is_domain_entry("192.0.2.1"))
         self.assertFalse(is_domain_entry("192.0.2.0/24"))
         self.assertFalse(is_domain_entry("2001:db8::/32"))
+
+    def test_normalizes_full_and_partial_domain_search_queries(self) -> None:
+        self.assertEqual(normalize_domain_search_query("  YA.RU. "), "ya.ru")
+        self.assertEqual(normalize_domain_search_query("ya"), "ya")
+        self.assertEqual(normalize_domain_search_query("*.Example.COM"), "example.com")
+        with self.assertRaises(ValidationError):
+            normalize_domain_search_query("two domains")
 
 
 if __name__ == "__main__":

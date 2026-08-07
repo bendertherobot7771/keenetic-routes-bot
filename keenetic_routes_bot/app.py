@@ -17,6 +17,7 @@ from .validation import (
     domain_covers,
     is_domain_entry,
     merge_entries,
+    normalize_domain_search_query,
     normalize_group_name,
     normalize_interface,
     parse_entries,
@@ -200,6 +201,18 @@ class BotApp:
                     chat_id,
                     self._bulk_entries_prompt("remove", domains_only=True),
                 )
+            elif callback_data == "groups_search":
+                self.sessions[user_id] = {"action": "search_domain_query"}
+                self._send(
+                    chat_id,
+                    "Введите полный домен или его часть.\n\n"
+                    "Примеры: <code>ya.ru</code>, <code>ya</code>\n\n"
+                    "/cancel — отмена",
+                )
+            elif callback_data == "groups_search_exact":
+                self._search_domains(user_id, chat_id, exact=True)
+            elif callback_data == "groups_search_partial":
+                self._search_domains(user_id, chat_id, exact=False)
             elif callback_data.startswith("g:"):
                 self._select_group(
                     user_id, chat_id, int(callback_data.split(":", 1)[1])
@@ -521,6 +534,96 @@ class BotApp:
             ),
         )
 
+    def _state_search_domain_query(self, user_id: int, chat_id: int, text: str) -> None:
+        query = normalize_domain_search_query(text)
+        self.sessions[user_id] = {"search_domain_query": query}
+        self._send(
+            chat_id,
+            f"Как искать <code>{html.escape(query)}</code>?\n\n"
+            "Точное совпадение найдёт только идентичный домен.\n"
+            "Частичное совпадение найдёт все домены, содержащие этот текст.",
+            keyboard=inline_keyboard(
+                [
+                    [("🎯 Точное совпадение", "groups_search_exact")],
+                    [("🔎 Частичное совпадение", "groups_search_partial")],
+                    [("Отмена", "groups")],
+                ]
+            ),
+        )
+
+    def _search_domains(self, user_id: int, chat_id: int, *, exact: bool) -> None:
+        query = str(self.sessions[user_id].get("search_domain_query", ""))
+        if not query:
+            raise ValidationError("Поисковый запрос устарел.")
+        groups = self.router.list_groups()
+        routes = self.router.list_dns_routes()
+        matches: list[tuple[FqdnGroup, str]] = []
+        for group in groups:
+            for entry in group.entries:
+                if not is_domain_entry(entry):
+                    continue
+                entry_key = entry.casefold().rstrip(".")
+                is_match = entry_key == query if exact else query in entry_key
+                if is_match:
+                    matches.append((group, entry))
+        self.sessions[user_id].clear()
+        mode = "точное" if exact else "частичное"
+        self.logger.info(
+            "Telegram user_id=%s searched FQDN query=%r exact=%s matches=%s",
+            user_id,
+            query,
+            exact,
+            len(matches),
+        )
+        if not matches:
+            self._send(
+                chat_id,
+                f"По запросу <code>{html.escape(query)}</code> "
+                f"({mode} совпадение) ничего не найдено.",
+                keyboard=inline_keyboard(
+                    [
+                        [("🔎 Новый поиск", "groups_search")],
+                        [("← К спискам", "groups")],
+                    ]
+                ),
+            )
+            return
+        lines: list[str] = []
+        for group, entry in matches:
+            display_name = group.description or group.name
+            linked = [route for route in routes if route.group == group.name]
+            lines.extend(
+                [
+                    f"<code>{html.escape(entry)}</code>",
+                    f"Список: <b>{html.escape(display_name)}</b>",
+                ]
+            )
+            if linked:
+                lines.append("Правила:")
+                lines.extend(
+                    f"• {'🟢' if route.enabled else '⚪'} "
+                    f"<code>{html.escape(route.interface or route.gateway or 'любой')}</code>"
+                    f"{' exclusive' if route.reject else ''}"
+                    for route in linked
+                )
+            else:
+                lines.append("Правила: нет")
+            lines.append("")
+        self._send_paginated_lines(
+            chat_id,
+            lines,
+            title=(
+                f"🔎 <b>Найдено: {len(matches)}</b>\n"
+                f"Запрос: <code>{html.escape(query)}</code> · режим: {mode}"
+            ),
+            final_keyboard=inline_keyboard(
+                [
+                    [("🔎 Новый поиск", "groups_search")],
+                    [("← К спискам", "groups")],
+                ]
+            ),
+        )
+
     def _state_attach_group(self, user_id: int, chat_id: int, text: str) -> None:
         group = self._current_group(user_id)
         parts = shlex.split(text)
@@ -658,6 +761,7 @@ class BotApp:
         rows.extend(
             [
                 [("➕ Новый список", "group_new")],
+                [("🔎 Найти правило по домену", "groups_search")],
                 [("🗑 Удалить домены из списков", "groups_remove")],
                 [("🧹 Убрать дубликаты", "groups_dedupe")],
                 [("← Меню", "home")],

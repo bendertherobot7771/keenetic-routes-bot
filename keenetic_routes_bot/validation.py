@@ -27,6 +27,25 @@ def normalize_group_name(value: str) -> str:
     return name
 
 
+def normalize_domain_search_query(value: str) -> str:
+    query = value.strip().rstrip(".").casefold()
+    if query.startswith("*."):
+        query = query[2:]
+    if not query:
+        raise ValidationError("Поисковый запрос не может быть пустым.")
+    if any(char.isspace() for char in query) or "/" in query or "://" in query:
+        raise ValidationError("Введите один домен или его часть без пробелов и пути.")
+    try:
+        query = query.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValidationError("Некорректный поисковый запрос.") from exc
+    if len(query) > 253 or any(
+        char not in "abcdefghijklmnopqrstuvwxyz0123456789-." for char in query
+    ):
+        raise ValidationError("Некорректный поисковый запрос.")
+    return query
+
+
 def normalize_interface(value: str) -> str:
     interface = value.strip()
     if not _INTERFACE_RE.fullmatch(interface):
