@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from .config import Config
-from .models import DnsRoute, FqdnGroup
+from .models import DnsRoute, FqdnGroup, Ipv4Route
 from .rci import KeeneticRciClient, RciError
 from .telegram import TelegramClient, TelegramError, inline_keyboard
 from .validation import (
@@ -195,6 +195,22 @@ class BotApp:
                 self._prepare_groups_deduplicate(user_id, chat_id)
             elif callback_data == "groups_dedupe_yes":
                 self._confirm_groups_deduplicate(user_id, chat_id)
+            elif callback_data == "groups_interfaces":
+                self._start_dns_bulk_interface_selection(user_id, chat_id)
+            elif callback_data.startswith("dgb:"):
+                self._toggle_dns_bulk_group(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
+            elif callback_data == "dgb_all":
+                self._select_all_dns_bulk_groups(user_id, chat_id)
+            elif callback_data == "dgb_done":
+                self._prepare_dns_bulk_interface(user_id, chat_id)
+            elif callback_data.startswith("dgbif:"):
+                self._prepare_dns_bulk_interface_confirmation(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
+            elif callback_data == "dgb_apply":
+                self._apply_dns_bulk_interface(user_id, chat_id)
             elif callback_data == "groups_remove":
                 self.sessions[user_id] = {"action": "remove_entries_global"}
                 self._send(
@@ -248,8 +264,12 @@ class BotApp:
                 )
             elif callback_data == "g_attach":
                 self.sessions[user_id]["action"] = "attach_group"
+                interface_names = self._interface_names()
+                default_interface = self._format_interface(
+                    self.config.default_interface, interface_names
+                )
                 default_hint = (
-                    f"\nПо умолчанию: <code>{html.escape(self.config.default_interface)}</code>"
+                    f"\nПо умолчанию: <code>{html.escape(default_interface)}</code>"
                     if self.config.default_interface
                     else ""
                 )
@@ -270,17 +290,44 @@ class BotApp:
                 self._select_rule(user_id, chat_id, int(callback_data.split(":", 1)[1]))
             elif callback_data == "r_toggle":
                 self._toggle_rule(user_id, chat_id)
+            elif callback_data == "r_interface":
+                self._show_interface_choices(
+                    user_id,
+                    chat_id,
+                    title="Выберите новый интерфейс для DNS-правила",
+                    callback_prefix="rif",
+                    cancel_callback="rules",
+                )
+            elif callback_data.startswith("rif:"):
+                self._change_rule_interface(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
             elif callback_data == "r_delete":
                 self._prepare_rule_delete(user_id, chat_id)
             elif callback_data == "r_delete_yes":
                 self._confirm_rule_delete(user_id, chat_id)
             elif callback_data == "routes":
                 self._show_ipv4_routes(user_id, chat_id)
+            elif callback_data == "routes_interfaces":
+                self._show_ipv4_description_choices(user_id, chat_id)
+            elif callback_data.startswith("ipd:"):
+                self._select_ipv4_bulk_description(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
+            elif callback_data.startswith("ipbif:"):
+                self._prepare_ipv4_bulk_interface_confirmation(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
+            elif callback_data == "ipbi_apply":
+                self._apply_ipv4_bulk_interface(user_id, chat_id)
             elif callback_data == "route_add":
                 self.sessions[user_id] = {"action": "add_ipv4_routes"}
+                default_interface = self._format_interface(
+                    self.config.default_interface, self._interface_names()
+                )
                 default_hint = (
                     f"\nИнтерфейс по умолчанию: "
-                    f"<code>{html.escape(self.config.default_interface)}</code>"
+                    f"<code>{html.escape(default_interface)}</code>"
                     if self.config.default_interface
                     else ""
                 )
@@ -298,6 +345,18 @@ class BotApp:
                 )
             elif callback_data == "ip_toggle":
                 self._toggle_ipv4_route(user_id, chat_id)
+            elif callback_data == "ip_interface":
+                self._show_interface_choices(
+                    user_id,
+                    chat_id,
+                    title="Выберите новый интерфейс для IPv4-маршрута",
+                    callback_prefix="ipif",
+                    cancel_callback="routes",
+                )
+            elif callback_data.startswith("ipif:"):
+                self._change_ipv4_route_interface(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
             elif callback_data == "ip_delete":
                 self._prepare_ipv4_delete(user_id, chat_id)
             elif callback_data == "ip_delete_yes":
@@ -557,6 +616,7 @@ class BotApp:
             raise ValidationError("Поисковый запрос устарел.")
         groups = self.router.list_groups()
         routes = self.router.list_dns_routes()
+        interface_names = self._interface_names()
         matches: list[tuple[FqdnGroup, str]] = []
         for group in groups:
             for entry in group.entries:
@@ -600,12 +660,13 @@ class BotApp:
             )
             if linked:
                 lines.append("Правила:")
-                lines.extend(
-                    f"• {'🟢' if route.enabled else '⚪'} "
-                    f"<code>{html.escape(route.interface or route.gateway or 'любой')}</code>"
-                    f"{' exclusive' if route.reject else ''}"
-                    for route in linked
-                )
+                for route in linked:
+                    target = self._format_route_target(route, interface_names)
+                    lines.append(
+                        f"• {'🟢' if route.enabled else '⚪'} "
+                        f"<code>{html.escape(target)}</code>"
+                        f"{' exclusive' if route.reject else ''}"
+                    )
             else:
                 lines.append("Правила: нет")
             lines.append("")
@@ -660,10 +721,14 @@ class BotApp:
             interface,
             exclusive,
         )
+        group_label = self._format_group_name(group.name, {group.name: group})
+        interface_label = self._format_interface(
+            interface, self._interface_names()
+        )
         self._send(
             chat_id,
-            f"✅ Список <b>{html.escape(group.name)}</b> направлен через "
-            f"<code>{html.escape(interface)}</code>.\n"
+            f"✅ Список <b>{html.escape(group_label)}</b> направлен через "
+            f"<code>{html.escape(interface_label)}</code>.\n"
             f"Эксклюзивный маршрут: {'да' if exclusive else 'нет'}.",
             keyboard=self._group_keyboard(),
         )
@@ -732,9 +797,11 @@ class BotApp:
         lines = ["<b>Системные ID интерфейсов</b>", ""]
         for interface in interfaces[:80]:
             marker = "🟢" if interface.connected else "⚪"
+            label = self._format_interface(
+                interface.ident, {interface.ident: interface.description}
+            )
             lines.append(
-                f"{marker} <code>{html.escape(interface.ident)}</code> — "
-                f"{html.escape(interface.description)}"
+                f"{marker} <code>{html.escape(label)}</code>"
             )
         if len(interfaces) > 80:
             lines.append(f"\n…ещё {len(interfaces) - 80}")
@@ -762,6 +829,7 @@ class BotApp:
             [
                 [("➕ Новый список", "group_new")],
                 [("🔎 Найти правило по домену", "groups_search")],
+                [("🔄 Массово сменить интерфейс", "groups_interfaces")],
                 [("🗑 Удалить домены из списков", "groups_remove")],
                 [("🧹 Убрать дубликаты", "groups_dedupe")],
                 [("← Меню", "home")],
@@ -834,9 +902,10 @@ class BotApp:
             for route in self.router.list_dns_routes()
             if route.group == group.name
         ]
+        interface_names = self._interface_names()
         links = (
             ", ".join(
-                f"<code>{html.escape(route.interface or route.gateway or 'любой')}</code>"
+                f"<code>{html.escape(self._format_route_target(route, interface_names))}</code>"
                 for route in linked
             )
             or "нет"
@@ -908,15 +977,18 @@ class BotApp:
 
     def _show_rules(self, user_id: int, chat_id: int) -> None:
         rules = self.router.list_dns_routes()
+        groups = {group.name: group for group in self.router.list_groups()}
+        interface_names = self._interface_names()
         self.sessions[user_id].clear()
         rows: list[list[tuple[str, str]]] = []
         for position, route in enumerate(rules):
             marker = "🟢" if route.enabled else "⚪"
-            target = route.interface or route.gateway or "любой"
+            target = self._format_route_target(route, interface_names)
+            group_label = self._format_group_name(route.group, groups)
             rows.append(
                 [
                     (
-                        f"{marker} {route.group} → {target}",
+                        f"{marker} {group_label} → {target}",
                         f"r:{position}",
                     )
                 ]
@@ -930,14 +1002,16 @@ class BotApp:
 
     def _select_rule(self, user_id: int, chat_id: int, position: int) -> None:
         route = self.router.list_dns_routes()[position]
+        groups = {group.name: group for group in self.router.list_groups()}
         self.sessions[user_id] = {
             "current_rule": route.index,
             "current_rule_group": route.group,
         }
-        target = route.interface or route.gateway or "любой интерфейс"
+        target = self._format_route_target(route, self._interface_names())
+        group_label = self._format_group_name(route.group, groups)
         self._send(
             chat_id,
-            f"<b>{html.escape(route.group)}</b>\n\n"
+            f"<b>{html.escape(group_label)}</b>\n\n"
             f"Назначение: <code>{html.escape(target)}</code>\n"
             f"Включено: {'да' if route.enabled else 'нет'}\n"
             f"Автоматически: {'да' if route.auto else 'нет'}\n"
@@ -964,10 +1038,12 @@ class BotApp:
 
     def _prepare_rule_delete(self, user_id: int, chat_id: int) -> None:
         route = self._current_rule(user_id)
+        groups = {group.name: group for group in self.router.list_groups()}
+        group_label = self._format_group_name(route.group, groups)
         self.sessions[user_id]["confirm_rule_delete"] = route.index
         self._send(
             chat_id,
-            f"Удалить правило для списка <b>{html.escape(route.group)}</b>?",
+            f"Удалить правило для списка <b>{html.escape(group_label)}</b>?",
             keyboard=inline_keyboard(
                 [
                     [("🗑 Да, удалить", "r_delete_yes")],
@@ -995,20 +1071,28 @@ class BotApp:
 
     def _show_ipv4_routes(self, user_id: int, chat_id: int) -> None:
         routes = self.router.list_ipv4_routes()
+        interface_names = self._interface_names()
         self.sessions[user_id].clear()
         rows: list[list[tuple[str, str]]] = []
         for position, route in enumerate(routes[:90]):
             marker = "🟢" if route.enabled else "⚪"
-            target = route.interface or route.gateway or "любой"
+            target = self._format_route_target(route, interface_names)
+            description = route.comment or "без описания"
             rows.append(
                 [
                     (
-                        f"{marker} {route.destination} → {target}",
+                        f"{marker} {route.destination} → {target} · {description}",
                         f"ip:{position}",
                     )
                 ]
             )
-        rows.extend([[("➕ Добавить", "route_add")], [("← Меню", "home")]])
+        rows.extend(
+            [
+                [("➕ Добавить", "route_add")],
+                [("🔄 Сменить интерфейс по описанию", "routes_interfaces")],
+                [("← Меню", "home")],
+            ]
+        )
         suffix = "\nПоказаны первые 90." if len(routes) > 90 else ""
         self._send(
             chat_id,
@@ -1019,7 +1103,7 @@ class BotApp:
     def _select_ipv4_route(self, user_id: int, chat_id: int, position: int) -> None:
         route = self.router.list_ipv4_routes()[position]
         self.sessions[user_id] = {"current_ipv4_route": route.index}
-        target = route.interface or route.gateway or "любой"
+        target = self._format_route_target(route, self._interface_names())
         self._send(
             chat_id,
             f"<b>{html.escape(route.destination)}</b>\n\n"
@@ -1075,6 +1159,362 @@ class BotApp:
             keyboard=self._routes_keyboard(),
         )
 
+    def _show_interface_choices(
+        self,
+        user_id: int,
+        chat_id: int,
+        *,
+        title: str,
+        callback_prefix: str,
+        cancel_callback: str,
+    ) -> None:
+        interfaces = self.router.list_interfaces()
+        if not interfaces:
+            raise ValidationError("Интерфейсы не найдены.")
+        self.sessions[user_id]["interface_choices"] = tuple(
+            interface.ident for interface in interfaces
+        )
+        rows: list[list[tuple[str, str]]] = []
+        for position, interface in enumerate(interfaces):
+            label = self._format_interface(
+                interface.ident, {interface.ident: interface.description}
+            )
+            rows.append(
+                [
+                    (
+                        f"{'🟢' if interface.connected else '⚪'} {label}",
+                        f"{callback_prefix}:{position}",
+                    )
+                ]
+            )
+        rows.append([("Отмена", cancel_callback)])
+        self._send(
+            chat_id,
+            f"<b>{html.escape(title)}</b>",
+            keyboard=inline_keyboard(rows),
+        )
+
+    def _selected_interface(self, user_id: int, position: int) -> str:
+        choices = tuple(self.sessions[user_id].get("interface_choices", ()))
+        if position < 0 or position >= len(choices):
+            raise ValidationError("Список интерфейсов устарел.")
+        interface = str(choices[position])
+        available = {item.ident for item in self.router.list_interfaces()}
+        if interface not in available:
+            raise ValidationError("Выбранный интерфейс больше не существует.")
+        return interface
+
+    def _change_rule_interface(
+        self, user_id: int, chat_id: int, position: int
+    ) -> None:
+        route = self._current_rule(user_id)
+        interface = self._selected_interface(user_id, position)
+        if route.interface == interface and not route.gateway:
+            raise ValidationError("У правила уже установлен этот интерфейс.")
+        self.router.save_dns_route(replace(route, interface=interface, gateway=""))
+        self.sessions[user_id].clear()
+        interface_label = self._format_interface(interface, self._interface_names())
+        self.logger.info(
+            "Telegram user_id=%s changed DNS rule index=%r interface=%r",
+            user_id,
+            route.index,
+            interface,
+        )
+        self._send(
+            chat_id,
+            f"✅ Интерфейс DNS-правила изменён на "
+            f"<code>{html.escape(interface_label)}</code>.",
+            keyboard=inline_keyboard(
+                [[("← К правилам", "rules")], [("← Меню", "home")]]
+            ),
+        )
+
+    def _change_ipv4_route_interface(
+        self, user_id: int, chat_id: int, position: int
+    ) -> None:
+        route = self._current_ipv4_route(user_id)
+        interface = self._selected_interface(user_id, position)
+        if route.interface == interface and not route.gateway:
+            raise ValidationError("У маршрута уже установлен этот интерфейс.")
+        self.router.save_ipv4_route(replace(route, interface=interface, gateway=""))
+        self.sessions[user_id].clear()
+        interface_label = self._format_interface(interface, self._interface_names())
+        self.logger.info(
+            "Telegram user_id=%s changed IPv4 route index=%r interface=%r",
+            user_id,
+            route.index,
+            interface,
+        )
+        self._send(
+            chat_id,
+            f"✅ Интерфейс IPv4-маршрута изменён на "
+            f"<code>{html.escape(interface_label)}</code>.",
+            keyboard=self._routes_keyboard(),
+        )
+
+    def _start_dns_bulk_interface_selection(
+        self, user_id: int, chat_id: int
+    ) -> None:
+        routed_groups = {route.group for route in self.router.list_dns_routes()}
+        group_names = tuple(
+            group.name
+            for group in self.router.list_groups()
+            if group.name in routed_groups
+        )
+        if not group_names:
+            raise ValidationError("Нет DNS-списков со связанными правилами.")
+        self.sessions[user_id] = {
+            "dns_bulk_groups": group_names,
+            "dns_bulk_selected": [],
+        }
+        self._show_dns_bulk_group_selection(user_id, chat_id)
+
+    def _show_dns_bulk_group_selection(self, user_id: int, chat_id: int) -> None:
+        group_names = tuple(self.sessions[user_id].get("dns_bulk_groups", ()))
+        selected = set(self.sessions[user_id].get("dns_bulk_selected", ()))
+        groups = {group.name: group for group in self.router.list_groups()}
+        rows: list[list[tuple[str, str]]] = []
+        for position, name in enumerate(group_names):
+            marker = "☑️" if name in selected else "⬜"
+            rows.append(
+                [
+                    (
+                        f"{marker} {self._format_group_name(name, groups)}",
+                        f"dgb:{position}",
+                    )
+                ]
+            )
+        rows.extend(
+            [
+                [("Выбрать все", "dgb_all")],
+                [(f"Продолжить ({len(selected)})", "dgb_done")],
+                [("Отмена", "groups")],
+            ]
+        )
+        self._send(
+            chat_id,
+            "<b>Массовая смена интерфейса DNS</b>\n\n"
+            "Выберите списки, для правил которых нужно сменить интерфейс.",
+            keyboard=inline_keyboard(rows),
+        )
+
+    def _toggle_dns_bulk_group(
+        self, user_id: int, chat_id: int, position: int
+    ) -> None:
+        group_names = tuple(self.sessions[user_id].get("dns_bulk_groups", ()))
+        if position < 0 or position >= len(group_names):
+            raise ValidationError("Список DNS-групп устарел.")
+        selected = set(self.sessions[user_id].get("dns_bulk_selected", ()))
+        name = group_names[position]
+        if name in selected:
+            selected.remove(name)
+        else:
+            selected.add(name)
+        self.sessions[user_id]["dns_bulk_selected"] = list(selected)
+        self._show_dns_bulk_group_selection(user_id, chat_id)
+
+    def _select_all_dns_bulk_groups(self, user_id: int, chat_id: int) -> None:
+        group_names = tuple(self.sessions[user_id].get("dns_bulk_groups", ()))
+        if not group_names:
+            raise ValidationError("Список DNS-групп устарел.")
+        self.sessions[user_id]["dns_bulk_selected"] = list(group_names)
+        self._show_dns_bulk_group_selection(user_id, chat_id)
+
+    def _prepare_dns_bulk_interface(self, user_id: int, chat_id: int) -> None:
+        selected = tuple(self.sessions[user_id].get("dns_bulk_selected", ()))
+        if not selected:
+            raise ValidationError("Выберите хотя бы один DNS-список.")
+        self._show_interface_choices(
+            user_id,
+            chat_id,
+            title="Выберите новый интерфейс для выбранных DNS-списков",
+            callback_prefix="dgbif",
+            cancel_callback="groups",
+        )
+
+    def _prepare_dns_bulk_interface_confirmation(
+        self, user_id: int, chat_id: int, position: int
+    ) -> None:
+        interface = self._selected_interface(user_id, position)
+        selected = set(self.sessions[user_id].get("dns_bulk_selected", ()))
+        routes = [
+            replace(route, interface=interface, gateway="")
+            for route in self.router.list_dns_routes()
+            if route.group in selected
+            and (route.interface != interface or bool(route.gateway))
+        ]
+        if not routes:
+            raise ValidationError("У выбранных правил уже установлен этот интерфейс.")
+        self.sessions[user_id]["pending_dns_bulk_interface"] = interface
+        interface_label = self._format_interface(interface, self._interface_names())
+        self._send(
+            chat_id,
+            f"Сменить интерфейс у DNS-правил: <b>{len(routes)}</b>?\n"
+            f"Списков: <b>{len({route.group for route in routes})}</b>.\n"
+            f"Новый интерфейс: <code>{html.escape(interface_label)}</code>.",
+            keyboard=inline_keyboard(
+                [
+                    [("✅ Сменить", "dgb_apply")],
+                    [("Отмена", "groups")],
+                ]
+            ),
+        )
+
+    def _apply_dns_bulk_interface(self, user_id: int, chat_id: int) -> None:
+        interface = str(
+            self.sessions[user_id].get("pending_dns_bulk_interface", "")
+        )
+        available = {item.ident for item in self.router.list_interfaces()}
+        if not interface or interface not in available:
+            raise ValidationError("Выбранный интерфейс больше не существует.")
+        selected = set(self.sessions[user_id].get("dns_bulk_selected", ()))
+        routes = [
+            replace(route, interface=interface, gateway="")
+            for route in self.router.list_dns_routes()
+            if route.group in selected
+            and (route.interface != interface or bool(route.gateway))
+        ]
+        if not routes:
+            raise ValidationError("Правила уже изменены или больше не существуют.")
+        self.router.save_dns_routes(routes)
+        self.sessions[user_id].clear()
+        interface_label = self._format_interface(interface, self._interface_names())
+        changed_groups = {route.group for route in routes}
+        self.logger.info(
+            "Telegram user_id=%s bulk changed DNS interfaces groups=%s rules=%s interface=%r",
+            user_id,
+            len(changed_groups),
+            len(routes),
+            interface,
+        )
+        self._send(
+            chat_id,
+            f"✅ Интерфейс изменён у правил: <b>{len(routes)}</b>; "
+            f"DNS-списков: <b>{len(changed_groups)}</b>.\n"
+            f"Новый интерфейс: <code>{html.escape(interface_label)}</code>.",
+            keyboard=inline_keyboard(
+                [[("DNS-списки", "groups")], [("← Меню", "home")]]
+            ),
+        )
+
+    def _show_ipv4_description_choices(self, user_id: int, chat_id: int) -> None:
+        routes = self.router.list_ipv4_routes()
+        descriptions = tuple(
+            sorted({route.comment for route in routes if route.comment}, key=str.casefold)
+        )
+        if not descriptions:
+            raise ValidationError("Нет IPv4-маршрутов с заполненным описанием.")
+        counts = {
+            description: sum(route.comment == description for route in routes)
+            for description in descriptions
+        }
+        self.sessions[user_id] = {"ipv4_bulk_descriptions": descriptions}
+        rows = [
+            [
+                (
+                    f"{description} · {counts[description]}",
+                    f"ipd:{position}",
+                )
+            ]
+            for position, description in enumerate(descriptions)
+        ]
+        rows.append([("Отмена", "routes")])
+        self._send(
+            chat_id,
+            "<b>Массовая смена интерфейса IPv4</b>\n\n"
+            "Выберите описание маршрутов.",
+            keyboard=inline_keyboard(rows),
+        )
+
+    def _select_ipv4_bulk_description(
+        self, user_id: int, chat_id: int, position: int
+    ) -> None:
+        descriptions = tuple(
+            self.sessions[user_id].get("ipv4_bulk_descriptions", ())
+        )
+        if position < 0 or position >= len(descriptions):
+            raise ValidationError("Список описаний устарел.")
+        description = str(descriptions[position])
+        self.sessions[user_id]["ipv4_bulk_description"] = description
+        self._show_interface_choices(
+            user_id,
+            chat_id,
+            title=f"Новый интерфейс для маршрутов «{description}»",
+            callback_prefix="ipbif",
+            cancel_callback="routes",
+        )
+
+    def _prepare_ipv4_bulk_interface_confirmation(
+        self, user_id: int, chat_id: int, position: int
+    ) -> None:
+        interface = self._selected_interface(user_id, position)
+        description = str(
+            self.sessions[user_id].get("ipv4_bulk_description", "")
+        )
+        if not description:
+            raise ValidationError("Выбранное описание устарело.")
+        routes = [
+            replace(route, interface=interface, gateway="")
+            for route in self.router.list_ipv4_routes()
+            if route.comment == description
+            and (route.interface != interface or bool(route.gateway))
+        ]
+        if not routes:
+            raise ValidationError("У этих маршрутов уже установлен этот интерфейс.")
+        self.sessions[user_id]["pending_ipv4_bulk_interface"] = interface
+        interface_label = self._format_interface(interface, self._interface_names())
+        self._send(
+            chat_id,
+            f"Сменить интерфейс у IPv4-маршрутов: <b>{len(routes)}</b>?\n"
+            f"Описание: <b>{html.escape(description)}</b>.\n"
+            f"Новый интерфейс: <code>{html.escape(interface_label)}</code>.",
+            keyboard=inline_keyboard(
+                [
+                    [("✅ Сменить", "ipbi_apply")],
+                    [("Отмена", "routes")],
+                ]
+            ),
+        )
+
+    def _apply_ipv4_bulk_interface(self, user_id: int, chat_id: int) -> None:
+        interface = str(
+            self.sessions[user_id].get("pending_ipv4_bulk_interface", "")
+        )
+        available = {item.ident for item in self.router.list_interfaces()}
+        if not interface or interface not in available:
+            raise ValidationError("Выбранный интерфейс больше не существует.")
+        description = str(
+            self.sessions[user_id].get("ipv4_bulk_description", "")
+        )
+        if not description:
+            raise ValidationError("Выбранное описание устарело.")
+        routes = [
+            replace(route, interface=interface, gateway="")
+            for route in self.router.list_ipv4_routes()
+            if route.comment == description
+            and (route.interface != interface or bool(route.gateway))
+        ]
+        if not routes:
+            raise ValidationError("Маршруты уже изменены или больше не существуют.")
+        self.router.save_ipv4_routes(routes)
+        self.sessions[user_id].clear()
+        interface_label = self._format_interface(interface, self._interface_names())
+        self.logger.info(
+            "Telegram user_id=%s bulk changed IPv4 interfaces "
+            "description=%r routes=%s interface=%r",
+            user_id,
+            description,
+            len(routes),
+            interface,
+        )
+        self._send(
+            chat_id,
+            f"✅ Интерфейс изменён у IPv4-маршрутов: <b>{len(routes)}</b>.\n"
+            f"Описание: <b>{html.escape(description)}</b>.\n"
+            f"Новый интерфейс: <code>{html.escape(interface_label)}</code>.",
+            keyboard=self._routes_keyboard(),
+        )
+
     def _current_group(self, user_id: int) -> FqdnGroup:
         name = str(self.sessions[user_id].get("current_group", ""))
         group = self.router.get_group(name)
@@ -1092,7 +1532,7 @@ class BotApp:
             raise ValidationError("Правило больше не существует.")
         return route
 
-    def _current_ipv4_route(self, user_id: int):
+    def _current_ipv4_route(self, user_id: int) -> Ipv4Route:
         index = str(self.sessions[user_id].get("current_ipv4_route", ""))
         route = next(
             (item for item in self.router.list_ipv4_routes() if item.index == index),
@@ -1217,6 +1657,7 @@ class BotApp:
         return inline_keyboard(
             [
                 [(("⏸ Выключить" if enabled else "▶️ Включить"), "r_toggle")],
+                [("🔄 Сменить интерфейс", "r_interface")],
                 [("🗑 Удалить правило", "r_delete")],
                 [("← К правилам", "rules"), ("← Меню", "home")],
             ]
@@ -1231,10 +1672,46 @@ class BotApp:
         return inline_keyboard(
             [
                 [(("⏸ Выключить" if enabled else "▶️ Включить"), "ip_toggle")],
+                [("🔄 Сменить интерфейс", "ip_interface")],
                 [("🗑 Удалить маршрут", "ip_delete")],
                 [("← К маршрутам", "routes"), ("← Меню", "home")],
             ]
         )
+
+    def _interface_names(self) -> dict[str, str]:
+        return {
+            interface.ident: interface.description
+            for interface in self.router.list_interfaces()
+        }
+
+    @staticmethod
+    def _format_interface(interface: str, names: dict[str, str]) -> str:
+        if not interface:
+            return "любой интерфейс"
+        description = names.get(interface, "").strip()
+        if description and description.casefold() != interface.casefold():
+            return f"{interface} ({description})"
+        return interface
+
+    @classmethod
+    def _format_route_target(
+        cls,
+        route: DnsRoute | Ipv4Route,
+        interface_names: dict[str, str],
+    ) -> str:
+        if route.interface:
+            return cls._format_interface(route.interface, interface_names)
+        return route.gateway or "любой интерфейс"
+
+    @staticmethod
+    def _format_group_name(
+        name: str, groups: dict[str, FqdnGroup]
+    ) -> str:
+        group = groups.get(name)
+        description = (group.description if group else "").strip()
+        if description and description.casefold() != name.casefold():
+            return f"{name} ({description})"
+        return name
 
     def _find_domain_conflicts(
         self, additions: tuple[str, ...]

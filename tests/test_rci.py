@@ -151,6 +151,65 @@ class RciClientTests(unittest.TestCase):
             all("path" not in item for item in self.transport.calls[-1][2])
         )
 
+    def test_updates_ipv4_routes_by_index_in_one_batch(self) -> None:
+        self.client.save_ipv4_routes(
+            [
+                Ipv4Route(
+                    index="7",
+                    destination="149.154.160.0/20",
+                    interface="Wireguard3",
+                    auto=True,
+                    reject=True,
+                    enabled=False,
+                    comment="telegram",
+                ),
+                Ipv4Route(
+                    index="8",
+                    destination="91.108.4.0/22",
+                    interface="Wireguard3",
+                    comment="telegram",
+                ),
+            ]
+        )
+
+        payload = self.transport.calls[-1][2]
+        first = payload[0]["ip"]["route"]
+        self.assertEqual(first["index"], "7")
+        self.assertEqual(first["interface"], "Wireguard3")
+        self.assertEqual(first["comment"], "telegram")
+        self.assertTrue(first["reject"])
+        self.assertTrue(first["disable"])
+        self.assertEqual(
+            payload[-1], {"system": {"configuration": {"save": {}}}}
+        )
+
+    def test_updates_multiple_dns_routes_in_one_batch(self) -> None:
+        self.client.save_dns_routes(
+            [
+                DnsRoute("1", "domain-list0", interface="Wireguard3"),
+                DnsRoute(
+                    "2",
+                    "domain-list1",
+                    interface="Wireguard3",
+                    reject=True,
+                    enabled=False,
+                ),
+            ]
+        )
+
+        payload = self.transport.calls[-1][2]
+        route_updates = [
+            item["dns-proxy"]["route"]
+            for item in payload[:-1]
+            if "index" in item["dns-proxy"]["route"]
+        ]
+        self.assertEqual(len(route_updates), 2)
+        self.assertTrue(all(item["interface"] == "Wireguard3" for item in route_updates))
+        self.assertTrue(route_updates[1]["reject"])
+        self.assertEqual(
+            payload[-1], {"system": {"configuration": {"save": {}}}}
+        )
+
     def test_raises_for_nested_rci_error(self) -> None:
         self.transport.get_responses["http://127.0.0.1:79/rci/show/version"] = {
             "status": "error",

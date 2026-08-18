@@ -99,26 +99,31 @@ class KeeneticRciClient:
         ]
 
     def save_dns_route(self, route: DnsRoute) -> None:
+        self.save_dns_routes([route])
+
+    def save_dns_routes(self, routes: Iterable[DnsRoute]) -> None:
         queries: list[dict[str, Any]] = []
-        if route.index:
+        for route in routes:
+            if route.index:
+                queries.append(
+                    {
+                        "path": "dns-proxy.route",
+                        "data": {
+                            "disable": {
+                                "index": route.index,
+                                "no": route.enabled,
+                            }
+                        },
+                    }
+                )
             queries.append(
                 {
                     "path": "dns-proxy.route",
-                    "data": {
-                        "disable": {
-                            "index": route.index,
-                            "no": route.enabled,
-                        }
-                    },
+                    "data": route.to_rci(include_index=True),
                 }
             )
-        queries.append(
-            {
-                "path": "dns-proxy.route",
-                "data": route.to_rci(include_index=True),
-            }
-        )
-        self._write(queries)
+        if queries:
+            self._write(queries)
 
     def delete_dns_route(self, index: str) -> None:
         self._write(
@@ -149,6 +154,17 @@ class KeeneticRciClient:
     def add_ipv4_routes(self, routes: Iterable[Ipv4Route]) -> None:
         queries = [
             {"path": "ip.route", "data": route.to_rci(include_index=False)}
+            for route in routes
+        ]
+        if queries:
+            self._write(queries)
+
+    def save_ipv4_route(self, route: Ipv4Route) -> None:
+        self.save_ipv4_routes([route])
+
+    def save_ipv4_routes(self, routes: Iterable[Ipv4Route]) -> None:
+        queries = [
+            {"path": "ip.route", "data": route.to_rci(include_index=True)}
             for route in routes
         ]
         if queries:

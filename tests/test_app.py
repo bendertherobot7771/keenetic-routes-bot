@@ -4,7 +4,7 @@ import unittest
 
 from keenetic_routes_bot.app import BotApp
 from keenetic_routes_bot.config import Config
-from keenetic_routes_bot.models import DnsRoute, FqdnGroup, Interface
+from keenetic_routes_bot.models import DnsRoute, FqdnGroup, Interface, Ipv4Route
 
 
 class FakeTelegram:
@@ -34,7 +34,10 @@ class FakeRouter:
     def __init__(self) -> None:
         self.groups = [FqdnGroup("openai", "openai", ("openai.com",))]
         self.rules: list[DnsRoute] = []
+        self.ipv4_routes: list[Ipv4Route] = []
         self.saved_groups: list[FqdnGroup] = []
+        self.saved_dns_routes: list[DnsRoute] = []
+        self.saved_ipv4_routes: list[Ipv4Route] = []
 
     def version(self):
         return {"release": "5.1.1"}
@@ -56,11 +59,34 @@ class FakeRouter:
     def list_dns_routes(self):
         return list(self.rules)
 
+    def save_dns_route(self, route):
+        self.save_dns_routes([route])
+
+    def save_dns_routes(self, routes):
+        for route in routes:
+            self.saved_dns_routes.append(route)
+            self.rules = [item for item in self.rules if item.index != route.index]
+            self.rules.append(route)
+
     def list_ipv4_routes(self):
-        return []
+        return list(self.ipv4_routes)
+
+    def save_ipv4_route(self, route):
+        self.save_ipv4_routes([route])
+
+    def save_ipv4_routes(self, routes):
+        for route in routes:
+            self.saved_ipv4_routes.append(route)
+            self.ipv4_routes = [
+                item for item in self.ipv4_routes if item.index != route.index
+            ]
+            self.ipv4_routes.append(route)
 
     def list_interfaces(self):
-        return [Interface("u1Host", "WireGuard", True)]
+        return [
+            Interface("u1Host", "WireGuard", True),
+            Interface("Wireguard3", "fastVPS_Estonia", True),
+        ]
 
 
 class AppTests(unittest.TestCase):
@@ -354,24 +380,113 @@ class AppTests(unittest.TestCase):
             keyboard["inline_keyboard"][0][0]["text"],
             "🌐 Мой настоящий список · 1",
         )
-        self.assertEqual(
-            keyboard["inline_keyboard"][-2][0]["text"],
-            "🧹 Убрать дубликаты",
-        )
-        self.assertEqual(
-            keyboard["inline_keyboard"][-3][0]["text"],
-            "🗑 Удалить домены из списков",
-        )
-        self.assertEqual(
-            keyboard["inline_keyboard"][-4][0]["text"],
-            "🔎 Найти правило по домену",
-        )
+        labels = [row[0]["text"] for row in keyboard["inline_keyboard"]]
+        self.assertIn("🔎 Найти правило по домену", labels)
+        self.assertIn("🔄 Массово сменить интерфейс", labels)
+        self.assertIn("🗑 Удалить домены из списков", labels)
+        self.assertIn("🧹 Убрать дубликаты", labels)
 
     def test_group_domain_buttons_have_explicit_labels(self) -> None:
         keyboard = self.app._group_keyboard()["inline_keyboard"]
         self.assertEqual(keyboard[0][0]["text"], "📄 Показать домены")
         self.assertEqual(keyboard[1][0]["text"], "➕ Добавить домен")
         self.assertEqual(keyboard[1][1]["text"], "➖ Удалить домен")
+
+    def test_rules_show_group_and_interface_descriptions(self) -> None:
+        self.router.groups = [
+            FqdnGroup("domain-list0", "Социальные сети", ("example.com",))
+        ]
+        self.router.rules = [
+            DnsRoute("1", "domain-list0", interface="Wireguard3")
+        ]
+
+        self.app.handle_update(self.callback_update("rules"))
+
+        label = self.telegram.messages[-1][2]["inline_keyboard"][0][0]["text"]
+        self.assertIn("domain-list0 (Социальные сети)", label)
+        self.assertIn("Wireguard3 (fastVPS_Estonia)", label)
+
+    def test_ipv4_routes_show_description_and_interface_name(self) -> None:
+        self.router.ipv4_routes = [
+            Ipv4Route(
+                "7",
+                "149.154.160.0/20",
+                interface="Wireguard3",
+                comment="telegram",
+            )
+        ]
+
+        self.app.handle_update(self.callback_update("routes"))
+
+        label = self.telegram.messages[-1][2]["inline_keyboard"][0][0]["text"]
+        self.assertIn("Wireguard3 (fastVPS_Estonia)", label)
+        self.assertIn("telegram", label)
+
+    def test_changes_interface_for_one_dns_rule(self) -> None:
+        self.router.rules = [DnsRoute("1", "openai", interface="u1Host")]
+        self.app.handle_update(self.callback_update("rules"))
+        self.app.handle_update(self.callback_update("r:0"))
+        self.app.handle_update(self.callback_update("r_interface"))
+        self.app.handle_update(self.callback_update("rif:1"))
+
+        self.assertEqual(self.router.saved_dns_routes[-1].interface, "Wireguard3")
+        self.assertIn("fastVPS_Estonia", self.telegram.messages[-1][1])
+
+    def test_changes_interface_for_one_ipv4_route(self) -> None:
+        self.router.ipv4_routes = [
+            Ipv4Route("7", "149.154.160.0/20", interface="u1Host", comment="telegram")
+        ]
+        self.app.handle_update(self.callback_update("routes"))
+        self.app.handle_update(self.callback_update("ip:0"))
+        self.app.handle_update(self.callback_update("ip_interface"))
+        self.app.handle_update(self.callback_update("ipif:1"))
+
+        self.assertEqual(self.router.saved_ipv4_routes[-1].interface, "Wireguard3")
+
+    def test_bulk_changes_dns_interfaces_for_selected_groups(self) -> None:
+        self.router.groups = [
+            FqdnGroup("domain-list0", "Первый", ("one.example",)),
+            FqdnGroup("domain-list1", "Второй", ("two.example",)),
+        ]
+        self.router.rules = [
+            DnsRoute("1", "domain-list0", interface="u1Host"),
+            DnsRoute("2", "domain-list1", interface="u1Host", reject=True),
+        ]
+        self.app.handle_update(self.callback_update("groups_interfaces"))
+        self.app.handle_update(self.callback_update("dgb:1"))
+        self.app.handle_update(self.callback_update("dgb_done"))
+        self.app.handle_update(self.callback_update("dgbif:1"))
+        self.assertFalse(self.router.saved_dns_routes)
+        self.app.handle_update(self.callback_update("dgb_apply"))
+
+        self.assertEqual(len(self.router.saved_dns_routes), 1)
+        saved = self.router.saved_dns_routes[0]
+        self.assertEqual(saved.group, "domain-list1")
+        self.assertEqual(saved.interface, "Wireguard3")
+        self.assertTrue(saved.reject)
+
+    def test_bulk_changes_ipv4_interfaces_by_description(self) -> None:
+        self.router.ipv4_routes = [
+            Ipv4Route("1", "149.154.160.0/20", interface="u1Host", comment="telegram"),
+            Ipv4Route("2", "91.108.4.0/22", interface="u1Host", comment="telegram"),
+            Ipv4Route("3", "31.13.64.0/18", interface="u1Host", comment="social"),
+        ]
+        self.app.handle_update(self.callback_update("routes_interfaces"))
+        self.app.handle_update(self.callback_update("ipd:1"))
+        self.app.handle_update(self.callback_update("ipbif:1"))
+        self.assertFalse(self.router.saved_ipv4_routes)
+        self.app.handle_update(self.callback_update("ipbi_apply"))
+
+        self.assertEqual(len(self.router.saved_ipv4_routes), 2)
+        self.assertEqual(
+            {route.comment for route in self.router.saved_ipv4_routes}, {"telegram"}
+        )
+        self.assertTrue(
+            all(
+                route.interface == "Wireguard3"
+                for route in self.router.saved_ipv4_routes
+            )
+        )
 
 
 if __name__ == "__main__":

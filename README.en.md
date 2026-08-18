@@ -26,11 +26,14 @@ remain visible in the web UI and are saved through the standard
 - Search DNS rules by a full domain or fragment using exact or partial matching.
 - Warn when a domain already exists or is covered by a wildcard parent domain.
 - Remove exact duplicates and redundant subdomains across all FQDN lists.
-- Show the real list names configured in the Keenetic web UI.
+- Show both the system ID and the real user-defined name of a DNS list in rules.
 - Show the number of DNS lists and their total number of entries.
-- Create, enable, disable, and delete native DNS routing rules.
-- Add and manage native IPv4 routes in bulk.
-- List system interface IDs.
+- Create, enable, disable, delete, and change the interface of native DNS rules.
+- Change the interface of DNS rules in bulk for selected FQDN lists.
+- Add and manage native IPv4 routes in bulk, including individual interface
+  changes and bulk changes grouped by route description.
+- Show IPv4 route descriptions.
+- List system interface IDs together with their user-defined names.
 - Use `exclusive` DNS routes.
 - Ask for confirmation before destructive actions.
 - Restrict access to an allowlist of Telegram user IDs.
@@ -240,6 +243,16 @@ Each result includes the matched domain, the real FQDN list name, and linked DNS
 routing rules with their state, interface or gateway, and `exclusive` flag. The
 result also indicates when a list does not have a routing rule yet.
 
+DNS rules show both the system list name and its user-defined description, for
+example `domain-list0 (Social networks)`. Interfaces are shown throughout the
+bot as `Wireguard3 (fastVPS_Estonia)`.
+
+The interface of an individual DNS rule can be changed from its details screen.
+The **Change interfaces in bulk** button in the DNS lists section lets the user
+select multiple lists, choose a new interface, and update all linked DNS rules.
+The update requires confirmation; rule state and the `exclusive` option are
+preserved.
+
 ### IPv4 routes
 
 Use one line per route:
@@ -257,6 +270,15 @@ For example:
 ```
 
 If `DEFAULT_INTERFACE` is configured, the interface may be omitted.
+
+The route list and details screen show the CIDR, the system interface ID with
+its user-defined name, and Keenetic's **Description** field. An individual
+route's interface can be changed from its details screen.
+
+The **Change interface by description** button lists unique non-empty route
+descriptions and their route counts. After choosing a description and a new
+interface, the bot asks for confirmation and updates all routes whose
+description is an exact match while preserving their state and other parameters.
 
 ## Updating and uninstalling
 
