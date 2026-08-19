@@ -52,6 +52,31 @@ class TelegramClient:
         result = self.call("sendMessage", payload)
         return result if isinstance(result, dict) else {}
 
+    def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+        parse_mode: str = "HTML",
+        disable_web_page_preview: bool = True,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": str(disable_web_page_preview).lower(),
+        }
+        payload["reply_markup"] = json.dumps(
+            reply_markup or {"inline_keyboard": []},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        result = self.call("editMessageText", payload)
+        return result if isinstance(result, dict) else {}
+
     def answer_callback_query(
         self,
         callback_query_id: str,

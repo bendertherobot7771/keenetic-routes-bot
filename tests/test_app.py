@@ -10,7 +10,10 @@ from keenetic_routes_bot.models import DnsRoute, FqdnGroup, Interface, Ipv4Route
 class FakeTelegram:
     def __init__(self) -> None:
         self.messages: list[tuple[int, str, object]] = []
+        self.sent_messages: list[tuple[int, str, object]] = []
+        self.edited_messages: list[tuple[int, int, str, object]] = []
         self.answers: list[tuple[str, str, bool]] = []
+        self.next_message_id = 100
 
     def send_message(
         self,
@@ -21,8 +24,25 @@ class FakeTelegram:
         parse_mode="HTML",
         disable_web_page_preview=True,
     ):
+        message = (chat_id, text, reply_markup)
+        self.messages.append(message)
+        self.sent_messages.append(message)
+        self.next_message_id += 1
+        return {"message_id": self.next_message_id, "chat": {"id": chat_id}}
+
+    def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup=None,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    ):
         self.messages.append((chat_id, text, reply_markup))
-        return {}
+        self.edited_messages.append((chat_id, message_id, text, reply_markup))
+        return {"message_id": message_id, "chat": {"id": chat_id}}
 
     def answer_callback_query(
         self, callback_query_id: str, *, text: str = "", show_alert: bool = False
@@ -133,7 +153,10 @@ class AppTests(unittest.TestCase):
                 "id": "callback-1",
                 "from": {"id": user_id},
                 "data": data,
-                "message": {"chat": {"id": user_id, "type": "private"}},
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": user_id, "type": "private"},
+                },
             },
         }
 
@@ -394,7 +417,8 @@ class AppTests(unittest.TestCase):
         )
         labels = [row[0]["text"] for row in keyboard["inline_keyboard"]]
         self.assertIn("🔎 Найти правило по домену", labels)
-        self.assertIn("🔄 Массово сменить интерфейс", labels)
+        self.assertIn("🔄 Сменить интерфейс выборочно", labels)
+        self.assertIn("🔄 Сменить интерфейс во всех списках", labels)
         self.assertIn("🗑 Удалить домены из списков", labels)
         self.assertIn("🧹 Убрать дубликаты", labels)
 
@@ -476,6 +500,86 @@ class AppTests(unittest.TestCase):
         self.assertEqual(saved.group, "domain-list1")
         self.assertEqual(saved.interface, "Wireguard3")
         self.assertTrue(saved.reject)
+
+    def test_bulk_changes_dns_interfaces_for_all_groups(self) -> None:
+        self.router.groups = [
+            FqdnGroup("domain-list0", "Первый", ("one.example",)),
+            FqdnGroup("domain-list1", "Второй", ("two.example",)),
+            FqdnGroup("domain-list2", "Без правила", ("three.example",)),
+        ]
+        self.router.rules = [
+            DnsRoute("1", "domain-list0", interface="u1Host"),
+            DnsRoute("2", "domain-list1", interface="u1Host", reject=True),
+        ]
+
+        self.app.handle_update(self.callback_update("groups_interfaces_all"))
+        self.assertIn(
+            "для всех DNS-списков",
+            self.telegram.messages[-1][1],
+        )
+        self.app.handle_update(self.callback_update("dgbif:1"))
+        self.assertIn("Списков: <b>2</b>", self.telegram.messages[-1][1])
+        self.assertFalse(self.router.saved_dns_routes)
+        self.app.handle_update(self.callback_update("dgb_apply"))
+
+        self.assertEqual(len(self.router.saved_dns_routes), 2)
+        self.assertEqual(
+            {route.group for route in self.router.saved_dns_routes},
+            {"domain-list0", "domain-list1"},
+        )
+        self.assertTrue(
+            all(
+                route.interface == "Wireguard3"
+                for route in self.router.saved_dns_routes
+            )
+        )
+
+    def test_callback_navigation_edits_one_bot_message(self) -> None:
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_show"))
+
+        self.assertFalse(self.telegram.sent_messages)
+        self.assertEqual(len(self.telegram.edited_messages), 3)
+        self.assertTrue(
+            all(
+                message_id == 10
+                for _, message_id, _, _ in self.telegram.edited_messages
+            )
+        )
+
+    def test_message_response_edits_the_active_bot_message(self) -> None:
+        self.app.handle_update(self.message_update("/start"))
+        sent_message_id = self.app.active_messages[42]
+        self.app.handle_update(self.callback_update("group_new"))
+        self.app.handle_update(self.message_update("Новый список"))
+
+        self.assertEqual(len(self.telegram.sent_messages), 1)
+        self.assertEqual(self.telegram.edited_messages[-1][1], 10)
+        self.assertNotEqual(sent_message_id, 0)
+
+    def test_long_output_uses_pages_in_the_same_message(self) -> None:
+        self.router.groups = [
+            FqdnGroup(
+                "large",
+                "Большой список",
+                tuple(f"domain-{index:03d}.example.com" for index in range(300)),
+            )
+        ]
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_show"))
+
+        keyboard = self.telegram.messages[-1][2]
+        self.assertEqual(
+            keyboard["inline_keyboard"][0][-1]["callback_data"],
+            "page:1",
+        )
+        self.app.handle_update(self.callback_update("page:1"))
+
+        self.assertFalse(self.telegram.sent_messages)
+        self.assertEqual(self.telegram.edited_messages[-1][1], 10)
+        self.assertIn("(2/", self.telegram.edited_messages[-1][2])
 
     def test_bulk_changes_ipv4_interfaces_by_description(self) -> None:
         self.router.ipv4_routes = [

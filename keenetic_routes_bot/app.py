@@ -41,6 +41,10 @@ class BotApp:
         self.logger = logger or logging.getLogger(__name__)
         self.sessions: dict[int, dict[str, Any]] = defaultdict(dict)
         self.request_times: dict[int, deque[float]] = defaultdict(deque)
+        self.active_messages: dict[int, int] = {}
+        self.pagination: dict[
+            int, tuple[tuple[str, ...], dict[str, Any] | None]
+        ] = {}
 
     def run(self) -> None:
         offset: int | None = None
@@ -117,6 +121,9 @@ class BotApp:
             return
         if callback:
             callback_id = str(callback.get("id", ""))
+            message_id = int((callback.get("message") or {}).get("message_id", 0))
+            if message_id:
+                self.active_messages[chat_id] = message_id
             self.telegram.answer_callback_query(callback_id)
             self._handle_callback(user_id, chat_id, str(callback.get("data", "")))
             return
@@ -197,6 +204,8 @@ class BotApp:
                 self._confirm_groups_deduplicate(user_id, chat_id)
             elif callback_data == "groups_interfaces":
                 self._start_dns_bulk_interface_selection(user_id, chat_id)
+            elif callback_data == "groups_interfaces_all":
+                self._start_dns_all_interface_selection(user_id, chat_id)
             elif callback_data.startswith("dgb:"):
                 self._toggle_dns_bulk_group(
                     user_id, chat_id, int(callback_data.split(":", 1)[1])
@@ -211,6 +220,10 @@ class BotApp:
                 )
             elif callback_data == "dgb_apply":
                 self._apply_dns_bulk_interface(user_id, chat_id)
+            elif callback_data.startswith("page:"):
+                self._show_paginated_page(
+                    chat_id, int(callback_data.split(":", 1)[1])
+                )
             elif callback_data == "groups_remove":
                 self.sessions[user_id] = {"action": "remove_entries_global"}
                 self._send(
@@ -837,7 +850,13 @@ class BotApp:
             [
                 [("➕ Новый список", "group_new")],
                 [("🔎 Найти правило по домену", "groups_search")],
-                [("🔄 Массово сменить интерфейс", "groups_interfaces")],
+                [("🔄 Сменить интерфейс выборочно", "groups_interfaces")],
+                [
+                    (
+                        "🔄 Сменить интерфейс во всех списках",
+                        "groups_interfaces_all",
+                    )
+                ],
                 [("🗑 Удалить домены из списков", "groups_remove")],
                 [("🧹 Убрать дубликаты", "groups_dedupe")],
                 [("← Меню", "home")],
@@ -1269,12 +1288,7 @@ class BotApp:
     def _start_dns_bulk_interface_selection(
         self, user_id: int, chat_id: int
     ) -> None:
-        routed_groups = {route.group for route in self.router.list_dns_routes()}
-        group_names = tuple(
-            group.name
-            for group in self.router.list_groups()
-            if group.name in routed_groups
-        )
+        group_names = self._routed_dns_group_names()
         if not group_names:
             raise ValidationError("Нет DNS-списков со связанными правилами.")
         self.sessions[user_id] = {
@@ -1282,6 +1296,32 @@ class BotApp:
             "dns_bulk_selected": [],
         }
         self._show_dns_bulk_group_selection(user_id, chat_id)
+
+    def _start_dns_all_interface_selection(
+        self, user_id: int, chat_id: int
+    ) -> None:
+        group_names = self._routed_dns_group_names()
+        if not group_names:
+            raise ValidationError("Нет DNS-списков со связанными правилами.")
+        self.sessions[user_id] = {
+            "dns_bulk_groups": group_names,
+            "dns_bulk_selected": list(group_names),
+        }
+        self._show_interface_choices(
+            user_id,
+            chat_id,
+            title="Выберите новый интерфейс для всех DNS-списков",
+            callback_prefix="dgbif",
+            cancel_callback="groups",
+        )
+
+    def _routed_dns_group_names(self) -> tuple[str, ...]:
+        routed_groups = {route.group for route in self.router.list_dns_routes()}
+        return tuple(
+            group.name
+            for group in self.router.list_groups()
+            if group.name in routed_groups
+        )
 
     def _show_dns_bulk_group_selection(self, user_id: int, chat_id: int) -> None:
         group_names = tuple(self.sessions[user_id].get("dns_bulk_groups", ()))
@@ -1660,7 +1700,29 @@ class BotApp:
         *,
         keyboard: dict[str, Any] | None = None,
     ) -> None:
-        self.telegram.send_message(chat_id, text, reply_markup=keyboard)
+        message_id = self.active_messages.get(chat_id)
+        if message_id:
+            try:
+                self.telegram.edit_message_text(
+                    chat_id,
+                    message_id,
+                    text,
+                    reply_markup=keyboard,
+                )
+                return
+            except TelegramError as exc:
+                if "message is not modified" in str(exc).casefold():
+                    return
+                self.logger.warning(
+                    "Could not edit Telegram message chat_id=%s message_id=%s: %s",
+                    chat_id,
+                    message_id,
+                    exc,
+                )
+        result = self.telegram.send_message(chat_id, text, reply_markup=keyboard)
+        sent_message_id = int(result.get("message_id", 0))
+        if sent_message_id:
+            self.active_messages[chat_id] = sent_message_id
 
     def _send_paginated_lines(
         self,
@@ -1683,17 +1745,36 @@ class BotApp:
             current_length += extra
         if current or not pages:
             pages.append(current)
+        rendered_pages: list[str] = []
         for page_number, page in enumerate(pages, start=1):
             page_title = title
             if title and len(pages) > 1:
                 page_title += f" ({page_number}/{len(pages)})"
             prefix = f"{page_title}\n\n" if page_title else ""
-            keyboard = final_keyboard if page_number == len(pages) else None
-            self._send(
-                chat_id,
-                prefix + "\n".join(page),
-                keyboard=keyboard,
+            rendered_pages.append(prefix + "\n".join(page))
+        self.pagination[chat_id] = (tuple(rendered_pages), final_keyboard)
+        self._show_paginated_page(chat_id, 0)
+
+    def _show_paginated_page(self, chat_id: int, position: int) -> None:
+        pages, final_keyboard = self.pagination.get(chat_id, ((), None))
+        if position < 0 or position >= len(pages):
+            raise ValidationError("Страница больше не существует.")
+        rows: list[list[dict[str, str]]] = []
+        navigation: list[dict[str, str]] = []
+        if position > 0:
+            navigation.append(
+                {"text": "← Назад", "callback_data": f"page:{position - 1}"}
             )
+        if position + 1 < len(pages):
+            navigation.append(
+                {"text": "Далее →", "callback_data": f"page:{position + 1}"}
+            )
+        if navigation:
+            rows.append(navigation)
+        if final_keyboard:
+            rows.extend(final_keyboard.get("inline_keyboard", []))
+        keyboard = {"inline_keyboard": rows} if rows else None
+        self._send(chat_id, pages[position], keyboard=keyboard)
 
     def _send_help(self, chat_id: int) -> None:
         self._send(

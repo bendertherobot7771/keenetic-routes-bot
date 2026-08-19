@@ -29,7 +29,8 @@ remain visible in the web UI and are saved through the standard
 - Show both the system ID and the real user-defined name of a DNS list in rules.
 - Show the number of DNS lists and their total number of entries.
 - Create, enable, disable, delete, and change the interface of native DNS rules.
-- Change the interface of DNS rules in bulk for selected FQDN lists.
+- Change the interface of DNS rules in bulk for selected or all linked FQDN
+  lists at once.
 - Add and manage native IPv4 routes in bulk, including individual interface
   changes and bulk changes grouped by route description.
 - Delete IPv4 routes in bulk by their exact description.
@@ -37,6 +38,8 @@ remain visible in the web UI and are saved through the standard
 - List system interface IDs together with their user-defined names.
 - Use `exclusive` DNS routes.
 - Ask for confirmation before destructive actions.
+- Keep navigation, operation results, and long paginated lists in one edited
+  Telegram message instead of filling the chat with new bot messages.
 - Restrict access to an allowlist of Telegram user IDs.
 - Start automatically with Entware after a router reboot.
 
@@ -249,10 +252,16 @@ example `domain-list0 (Social networks)`. Interfaces are shown throughout the
 bot as `Wireguard3 (fastVPS_Estonia)`.
 
 The interface of an individual DNS rule can be changed from its details screen.
-The **Change interfaces in bulk** button in the DNS lists section lets the user
-select multiple lists, choose a new interface, and update all linked DNS rules.
-The update requires confirmation; rule state and the `exclusive` option are
-preserved.
+The **Change interface selectively** button lets the user select multiple lists,
+choose a new interface, and update their linked DNS rules. The **Change
+interface in all lists** button immediately selects every FQDN list that has a
+DNS routing rule. Both flows show the affected rule and list counts, require
+confirmation, and preserve rule state and the `exclusive` option.
+
+Menus, confirmations, and operation results are displayed by editing one
+message. Long results use **Back** and **Next** buttons instead of creating a
+chain of messages. A new message is sent only when the bot has no accessible
+message to edit, such as on first use or after the user deletes that message.
 
 ### IPv4 routes
 
