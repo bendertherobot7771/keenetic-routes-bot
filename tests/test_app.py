@@ -38,6 +38,7 @@ class FakeRouter:
         self.saved_groups: list[FqdnGroup] = []
         self.saved_dns_routes: list[DnsRoute] = []
         self.saved_ipv4_routes: list[Ipv4Route] = []
+        self.deleted_ipv4_indices: list[str] = []
 
     def version(self):
         return {"release": "5.1.1"}
@@ -81,6 +82,17 @@ class FakeRouter:
                 item for item in self.ipv4_routes if item.index != route.index
             ]
             self.ipv4_routes.append(route)
+
+    def delete_ipv4_route(self, index):
+        self.delete_ipv4_routes([index])
+
+    def delete_ipv4_routes(self, indices):
+        values = list(indices)
+        self.deleted_ipv4_indices.extend(values)
+        selected = set(values)
+        self.ipv4_routes = [
+            route for route in self.ipv4_routes if route.index not in selected
+        ]
 
     def list_interfaces(self):
         return [
@@ -487,6 +499,30 @@ class AppTests(unittest.TestCase):
                 for route in self.router.saved_ipv4_routes
             )
         )
+
+    def test_bulk_deletes_ipv4_routes_by_description_after_confirmation(self) -> None:
+        self.router.ipv4_routes = [
+            Ipv4Route("1", "149.154.160.0/20", interface="u1Host", comment="telegram"),
+            Ipv4Route("2", "91.108.4.0/22", interface="u1Host", comment="telegram"),
+            Ipv4Route("3", "31.13.64.0/18", interface="u1Host", comment="social"),
+        ]
+
+        self.app.handle_update(self.callback_update("routes"))
+        labels = [
+            row[0]["text"]
+            for row in self.telegram.messages[-1][2]["inline_keyboard"]
+        ]
+        self.assertIn("🗑 Удалить маршруты по описанию", labels)
+
+        self.app.handle_update(self.callback_update("routes_delete_descriptions"))
+        self.app.handle_update(self.callback_update("ipdd:1"))
+        self.assertFalse(self.router.deleted_ipv4_indices)
+        self.assertIn("Удалить IPv4-маршруты: <b>2</b>", self.telegram.messages[-1][1])
+
+        self.app.handle_update(self.callback_update("ipdd_apply"))
+        self.assertEqual(self.router.deleted_ipv4_indices, ["1", "2"])
+        self.assertEqual([route.index for route in self.router.ipv4_routes], ["3"])
+        self.assertIn("Удалено IPv4-маршрутов: <b>2</b>", self.telegram.messages[-1][1])
 
 
 if __name__ == "__main__":

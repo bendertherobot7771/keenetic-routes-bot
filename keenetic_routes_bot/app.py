@@ -310,6 +310,14 @@ class BotApp:
                 self._show_ipv4_routes(user_id, chat_id)
             elif callback_data == "routes_interfaces":
                 self._show_ipv4_description_choices(user_id, chat_id)
+            elif callback_data == "routes_delete_descriptions":
+                self._show_ipv4_delete_description_choices(user_id, chat_id)
+            elif callback_data.startswith("ipdd:"):
+                self._prepare_ipv4_delete_by_description(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
+            elif callback_data == "ipdd_apply":
+                self._apply_ipv4_delete_by_description(user_id, chat_id)
             elif callback_data.startswith("ipd:"):
                 self._select_ipv4_bulk_description(
                     user_id, chat_id, int(callback_data.split(":", 1)[1])
@@ -1090,6 +1098,12 @@ class BotApp:
             [
                 [("➕ Добавить", "route_add")],
                 [("🔄 Сменить интерфейс по описанию", "routes_interfaces")],
+                [
+                    (
+                        "🗑 Удалить маршруты по описанию",
+                        "routes_delete_descriptions",
+                    )
+                ],
                 [("← Меню", "home")],
             ]
         )
@@ -1512,6 +1526,103 @@ class BotApp:
             f"✅ Интерфейс изменён у IPv4-маршрутов: <b>{len(routes)}</b>.\n"
             f"Описание: <b>{html.escape(description)}</b>.\n"
             f"Новый интерфейс: <code>{html.escape(interface_label)}</code>.",
+            keyboard=self._routes_keyboard(),
+        )
+
+    def _show_ipv4_delete_description_choices(
+        self, user_id: int, chat_id: int
+    ) -> None:
+        routes = self.router.list_ipv4_routes()
+        descriptions = tuple(
+            sorted({route.comment for route in routes if route.comment}, key=str.casefold)
+        )
+        if not descriptions:
+            raise ValidationError("Нет IPv4-маршрутов с заполненным описанием.")
+        counts = {
+            description: sum(route.comment == description for route in routes)
+            for description in descriptions
+        }
+        self.sessions[user_id] = {"ipv4_delete_descriptions": descriptions}
+        rows = [
+            [
+                (
+                    f"{description} · {counts[description]}",
+                    f"ipdd:{position}",
+                )
+            ]
+            for position, description in enumerate(descriptions)
+        ]
+        rows.append([("Отмена", "routes")])
+        self._send(
+            chat_id,
+            "<b>Удаление IPv4-маршрутов по описанию</b>\n\n"
+            "Выберите описание. Будут удалены все маршруты с его точным "
+            "совпадением.",
+            keyboard=inline_keyboard(rows),
+        )
+
+    def _prepare_ipv4_delete_by_description(
+        self, user_id: int, chat_id: int, position: int
+    ) -> None:
+        descriptions = tuple(
+            self.sessions[user_id].get("ipv4_delete_descriptions", ())
+        )
+        if position < 0 or position >= len(descriptions):
+            raise ValidationError("Список описаний устарел.")
+        description = str(descriptions[position])
+        routes = [
+            route
+            for route in self.router.list_ipv4_routes()
+            if route.comment == description
+        ]
+        if not routes:
+            raise ValidationError("Маршруты с этим описанием больше не существуют.")
+        self.sessions[user_id]["pending_ipv4_delete_description"] = description
+        preview = "\n".join(
+            f"• <code>{html.escape(route.destination)}</code>"
+            for route in routes[:10]
+        )
+        suffix = f"\n…ещё {len(routes) - 10}" if len(routes) > 10 else ""
+        self._send(
+            chat_id,
+            f"Удалить IPv4-маршруты: <b>{len(routes)}</b>?\n"
+            f"Описание: <b>{html.escape(description)}</b>.\n\n"
+            f"{preview}{suffix}",
+            keyboard=inline_keyboard(
+                [
+                    [("🗑 Да, удалить все", "ipdd_apply")],
+                    [("Отмена", "routes")],
+                ]
+            ),
+        )
+
+    def _apply_ipv4_delete_by_description(
+        self, user_id: int, chat_id: int
+    ) -> None:
+        description = str(
+            self.sessions[user_id].get("pending_ipv4_delete_description", "")
+        )
+        if not description:
+            raise ValidationError("Подтверждение устарело.")
+        routes = [
+            route
+            for route in self.router.list_ipv4_routes()
+            if route.comment == description and route.index
+        ]
+        if not routes:
+            raise ValidationError("Маршруты уже удалены или больше не существуют.")
+        self.router.delete_ipv4_routes(route.index for route in routes)
+        self.sessions[user_id].clear()
+        self.logger.info(
+            "Telegram user_id=%s deleted IPv4 routes by description=%r count=%s",
+            user_id,
+            description,
+            len(routes),
+        )
+        self._send(
+            chat_id,
+            f"✅ Удалено IPv4-маршрутов: <b>{len(routes)}</b>.\n"
+            f"Описание: <b>{html.escape(description)}</b>.",
             keyboard=self._routes_keyboard(),
         )
 

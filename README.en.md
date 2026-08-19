@@ -32,6 +32,7 @@ remain visible in the web UI and are saved through the standard
 - Change the interface of DNS rules in bulk for selected FQDN lists.
 - Add and manage native IPv4 routes in bulk, including individual interface
   changes and bulk changes grouped by route description.
+- Delete IPv4 routes in bulk by their exact description.
 - Show IPv4 route descriptions.
 - List system interface IDs together with their user-defined names.
 - Use `exclusive` DNS routes.
@@ -277,8 +278,14 @@ route's interface can be changed from its details screen.
 
 The **Change interface by description** button lists unique non-empty route
 descriptions and their route counts. After choosing a description and a new
-interface, the bot asks for confirmation and updates all routes whose
-description is an exact match while preserving their state and other parameters.
+interface, the bot asks for confirmation, deletes the old routes, and creates
+replacement routes using the selected interface. This matches Keenetic RCI
+behavior and prevents old and new rules from remaining active at the same time.
+State, description, and other supported parameters are preserved.
+
+The **Delete routes by description** button lists unique non-empty descriptions
+and matching route counts. After selection and confirmation, the bot deletes all
+IPv4 routes whose description is an exact match in one RCI batch.
 
 ## Updating and uninstalling
 

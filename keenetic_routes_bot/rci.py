@@ -163,15 +163,31 @@ class KeeneticRciClient:
         self.save_ipv4_routes([route])
 
     def save_ipv4_routes(self, routes: Iterable[Ipv4Route]) -> None:
+        items = list(routes)
+        if any(not route.index for route in items):
+            raise RciError("Для замены IPv4-маршрута требуется его index.")
         queries = [
-            {"path": "ip.route", "data": route.to_rci(include_index=True)}
-            for route in routes
+            {"path": "ip.route", "data": {"index": route.index, "no": True}}
+            for route in items
         ]
+        queries.extend(
+            {"path": "ip.route", "data": route.to_rci(include_index=False)}
+            for route in items
+        )
         if queries:
             self._write(queries)
 
     def delete_ipv4_route(self, index: str) -> None:
-        self._write([{"path": "ip.route", "data": {"index": index, "no": True}}])
+        self.delete_ipv4_routes([index])
+
+    def delete_ipv4_routes(self, indices: Iterable[str]) -> None:
+        unique_indices = tuple(dict.fromkeys(index for index in indices if index))
+        queries = [
+            {"path": "ip.route", "data": {"index": index, "no": True}}
+            for index in unique_indices
+        ]
+        if queries:
+            self._write(queries)
 
     def set_ipv4_route_enabled(self, index: str, enabled: bool) -> None:
         self._write(

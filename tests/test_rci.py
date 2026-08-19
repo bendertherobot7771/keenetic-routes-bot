@@ -151,7 +151,7 @@ class RciClientTests(unittest.TestCase):
             all("path" not in item for item in self.transport.calls[-1][2])
         )
 
-    def test_updates_ipv4_routes_by_index_in_one_batch(self) -> None:
+    def test_replaces_ipv4_routes_by_deleting_old_indices_then_adding(self) -> None:
         self.client.save_ipv4_routes(
             [
                 Ipv4Route(
@@ -173,15 +173,42 @@ class RciClientTests(unittest.TestCase):
         )
 
         payload = self.transport.calls[-1][2]
-        first = payload[0]["ip"]["route"]
-        self.assertEqual(first["index"], "7")
-        self.assertEqual(first["interface"], "Wireguard3")
-        self.assertEqual(first["comment"], "telegram")
-        self.assertTrue(first["reject"])
-        self.assertTrue(first["disable"])
+        self.assertEqual(
+            payload[0], {"ip": {"route": {"index": "7", "no": True}}}
+        )
+        self.assertEqual(
+            payload[1], {"ip": {"route": {"index": "8", "no": True}}}
+        )
+        first_new = payload[2]["ip"]["route"]
+        second_new = payload[3]["ip"]["route"]
+        self.assertNotIn("index", first_new)
+        self.assertNotIn("index", second_new)
+        self.assertEqual(first_new["interface"], "Wireguard3")
+        self.assertEqual(first_new["comment"], "telegram")
+        self.assertTrue(first_new["reject"])
+        self.assertTrue(first_new["disable"])
         self.assertEqual(
             payload[-1], {"system": {"configuration": {"save": {}}}}
         )
+
+    def test_deletes_multiple_ipv4_routes_in_one_batch(self) -> None:
+        self.client.delete_ipv4_routes(["7", "8", "7", ""])
+
+        payload = self.transport.calls[-1][2]
+        self.assertEqual(
+            payload,
+            [
+                {"ip": {"route": {"index": "7", "no": True}}},
+                {"ip": {"route": {"index": "8", "no": True}}},
+                {"system": {"configuration": {"save": {}}}},
+            ],
+        )
+
+    def test_replacing_ipv4_route_requires_existing_index(self) -> None:
+        with self.assertRaisesRegex(RciError, "index"):
+            self.client.save_ipv4_route(
+                Ipv4Route("", "192.0.2.0/24", interface="u1Host")
+            )
 
     def test_updates_multiple_dns_routes_in_one_batch(self) -> None:
         self.client.save_dns_routes(
