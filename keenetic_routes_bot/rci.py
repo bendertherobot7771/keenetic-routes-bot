@@ -82,6 +82,37 @@ class KeeneticRciClient:
         )
         self._write(queries)
 
+    def create_group_with_dns_route(
+        self, group: FqdnGroup, interface: str
+    ) -> None:
+        if self.get_group(group.name) is not None:
+            raise RciError("DNS-список с таким именем уже существует.")
+        self._write(
+            [
+                {
+                    "path": "object-group.fqdn",
+                    "data": {
+                        group.name: {
+                            "description": group.description or group.name,
+                            "include": [
+                                {"address": address} for address in group.entries
+                            ],
+                        }
+                    },
+                },
+                {
+                    "path": "dns-proxy.route",
+                    "data": DnsRoute(
+                        index="",
+                        group=group.name,
+                        interface=interface,
+                        auto=True,
+                        enabled=True,
+                    ).to_rci(include_index=False),
+                },
+            ]
+        )
+
     def delete_group(self, name: str) -> None:
         self._write(
             [
@@ -136,14 +167,22 @@ class KeeneticRciClient:
         )
 
     def set_dns_route_enabled(self, index: str, enabled: bool) -> None:
-        self._write(
-            [
-                {
-                    "path": "dns-proxy.route",
-                    "data": {"disable": {"index": index, "no": enabled}},
-                }
-            ]
-        )
+        self.set_dns_routes_enabled([index], enabled)
+
+    def set_dns_routes_enabled(
+        self, indices: Iterable[str], enabled: bool
+    ) -> None:
+        unique_indices = tuple(dict.fromkeys(index for index in indices if index))
+        if unique_indices:
+            self._write(
+                [
+                    {
+                        "path": "dns-proxy.route",
+                        "data": {"disable": {"index": index, "no": enabled}},
+                    }
+                    for index in unique_indices
+                ]
+            )
 
     def list_ipv4_routes(self) -> list[Ipv4Route]:
         raw = self._get("show.sc.ip.route")

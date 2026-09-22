@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
+import os
 import shlex
+import tempfile
 import time
 from collections import defaultdict, deque
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from .config import Config
@@ -45,6 +49,7 @@ class BotApp:
         self.pagination: dict[
             int, tuple[tuple[str, ...], dict[str, Any] | None]
         ] = {}
+        self._load_active_messages()
 
     def run(self) -> None:
         offset: int | None = None
@@ -67,10 +72,9 @@ class BotApp:
                         )
                         chat_id = _chat_id(update)
                         if chat_id is not None:
-                            self._send(
+                            self._notify_error(
                                 chat_id,
-                                "❌ Внутренняя ошибка. Подробности записаны в журнал.",
-                                keyboard=self._home_keyboard(),
+                                "Внутренняя ошибка. Подробности записаны в журнал.",
                             )
             except TelegramError as exc:
                 self.logger.warning("%s; retry in %s seconds", exc, retry_delay)
@@ -97,7 +101,7 @@ class BotApp:
                     show_alert=True,
                 )
             elif chat_id:
-                self._send(chat_id, "⛔ Доступ запрещён.")
+                self._notify_error(chat_id, "Доступ запрещён.")
             return
         if self.config.private_chats_only and chat.get("type") != "private":
             if callback:
@@ -107,7 +111,7 @@ class BotApp:
                     show_alert=True,
                 )
             elif chat_id:
-                self._send(chat_id, "⛔ Используйте личный чат с ботом.")
+                self._notify_error(chat_id, "Используйте личный чат с ботом.")
             return
         if not self._rate_limit_ok(user_id):
             if callback:
@@ -117,20 +121,53 @@ class BotApp:
                     show_alert=True,
                 )
             else:
-                self._send(chat_id, "⏳ Слишком много команд. Повторите через минуту.")
+                self._notify_error(chat_id, "Слишком много команд. Повторите через минуту.")
             return
         if callback:
             callback_id = str(callback.get("id", ""))
             message_id = int((callback.get("message") or {}).get("message_id", 0))
             if message_id:
                 self.active_messages[chat_id] = message_id
+                self._save_active_messages()
             self.telegram.answer_callback_query(callback_id)
             self._handle_callback(user_id, chat_id, str(callback.get("data", "")))
             return
         if message:
             text = str(message.get("text", "")).strip()
-            if text:
+            if not text:
+                self._notify_error(chat_id, "Отправьте текстовую команду или данные.")
+                return
+            try:
                 self._handle_message(user_id, chat_id, text)
+            except (ValidationError, RciError) as exc:
+                self.logger.warning("Message processing failed: %s", exc)
+                self._notify_error(chat_id, str(exc))
+                return
+            except Exception:
+                self.logger.exception(
+                    "Unexpected message processing error, user_id=%s", user_id
+                )
+                self._notify_error(
+                    chat_id,
+                    "Внутренняя ошибка. Проверьте результат перед повтором операции.",
+                )
+                return
+            message_id = int(message.get("message_id", 0))
+            if message_id:
+                try:
+                    self.telegram.delete_message(chat_id, message_id)
+                except TelegramError as exc:
+                    self.logger.warning(
+                        "Could not delete processed Telegram message chat_id=%s "
+                        "message_id=%s: %s",
+                        chat_id,
+                        message_id,
+                        exc,
+                    )
+                    self._notify_error(
+                        chat_id,
+                        "Данные обработаны, но удалить Ваше сообщение не удалось.",
+                    )
 
     def _handle_message(self, user_id: int, chat_id: int, text: str) -> None:
         command = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
@@ -168,14 +205,11 @@ class BotApp:
                 keyboard=self._home_keyboard(),
             )
             return
-        try:
-            handler = getattr(self, f"_state_{action}")
-            handler(user_id, chat_id, text)
-        except AttributeError:
+        handler = getattr(self, f"_state_{action}", None)
+        if handler is None:
             self.sessions[user_id].clear()
-            self._send(chat_id, "Состояние диалога сброшено. Откройте меню заново.")
-        except (ValidationError, RciError) as exc:
-            self._send(chat_id, f"❌ {html.escape(str(exc))}")
+            raise ValidationError("Состояние диалога сброшено. Откройте меню заново.")
+        handler(user_id, chat_id, text)
 
     def _handle_callback(self, user_id: int, chat_id: int, callback_data: str) -> None:
         try:
@@ -260,6 +294,10 @@ class BotApp:
                 self._cancel_group_add(user_id, chat_id)
             elif callback_data == "g_create_yes":
                 self._confirm_group_create(user_id, chat_id)
+            elif callback_data.startswith("gnewif:"):
+                self._create_group_with_interface(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
             elif callback_data == "g_create_cancel":
                 self.sessions[user_id].clear()
                 self._send(
@@ -278,21 +316,29 @@ class BotApp:
             elif callback_data == "g_attach":
                 self.sessions[user_id]["action"] = "attach_group"
                 interface_names = self._interface_names()
+                default_available = self.config.default_interface in interface_names
                 default_interface = self._format_interface(
                     self.config.default_interface, interface_names
                 )
                 default_hint = (
                     f"\nПо умолчанию: <code>{html.escape(default_interface)}</code>"
-                    if self.config.default_interface
-                    else ""
+                    if self.config.default_interface and default_available
+                    else (
+                        "\nНастроенный интерфейс по умолчанию недоступен; "
+                        "укажите действующий системный ID."
+                        if self.config.default_interface
+                        else ""
+                    )
                 )
                 self._send(
                     chat_id,
                     "Введите системный ID интерфейса и необязательный режим "
                     "<code>exclusive</code>.\n"
-                    "Пример: <code>u1Host exclusive</code>"
+                    "Пример: <code>Wireguard0 exclusive</code>"
                     f"{default_hint}\n\n/interfaces — показать интерфейсы",
                 )
+            elif callback_data == "g_toggle":
+                self._toggle_group_dns_routes(user_id, chat_id)
             elif callback_data == "g_delete":
                 self._prepare_group_delete(user_id, chat_id)
             elif callback_data == "g_delete_yes":
@@ -357,7 +403,7 @@ class BotApp:
                     "Отправьте маршруты по одному в строке:\n"
                     "<code>CIDR INTERFACE описание</code>\n\n"
                     "Пример:\n"
-                    "<code>149.154.160.0/20 u1Host telegram</code>"
+                    "<code>149.154.160.0/20 Wireguard0 telegram</code>"
                     f"{default_hint}",
                 )
             elif callback_data.startswith("ip:"):
@@ -431,29 +477,53 @@ class BotApp:
                 cancel_callback="g_create_cancel",
             )
             return
-        self._create_group(user_id, chat_id, name, entries)
+        self.sessions[user_id].update({"action": "", "pending_entries": entries})
+        self._choose_new_group_interface(user_id, chat_id)
 
-    def _create_group(
+    def _choose_new_group_interface(self, user_id: int, chat_id: int) -> None:
+        name = str(self.sessions[user_id].get("pending_group", ""))
+        entries = tuple(self.sessions[user_id].get("pending_entries", ()))
+        if not name or not entries:
+            raise ValidationError("Подтверждение устарело.")
+        self._show_interface_choices(
+            user_id,
+            chat_id,
+            title=f"Выберите интерфейс для нового списка «{name}»",
+            callback_prefix="gnewif",
+            cancel_callback="groups",
+        )
+
+    def _create_group_with_interface(
         self,
         user_id: int,
         chat_id: int,
-        name: str,
-        entries: tuple[str, ...],
+        position: int,
     ) -> None:
-        self.router.save_group(
-            FqdnGroup(name=name, description=name, entries=entries),
-            replace=False,
+        name = str(self.sessions[user_id].get("pending_group", ""))
+        entries = tuple(self.sessions[user_id].get("pending_entries", ()))
+        if not name or not entries:
+            raise ValidationError("Подтверждение устарело.")
+        interface = self._selected_interface(user_id, position)
+        if self.router.get_group(name) is not None:
+            raise ValidationError("Список с таким именем уже существует.")
+        self.router.create_group_with_dns_route(
+            FqdnGroup(name=name, description=name, entries=entries), interface
         )
+        self._ensure_dns_route_active(name, interface)
         self.sessions[user_id] = {"current_group": name}
         self.logger.info(
-            "Telegram user_id=%s created FQDN group=%r entries=%s",
+            "Telegram user_id=%s created routed FQDN group=%r entries=%s interface=%r",
             user_id,
             name,
             len(entries),
+            interface,
         )
+        interface_label = self._format_interface(interface, self._interface_names())
         self._send(
             chat_id,
-            f"✅ Список <b>{html.escape(name)}</b> создан: {len(entries)} записей.",
+            f"✅ Список <b>{html.escape(name)}</b> создан: {len(entries)} записей.\n"
+            f"Маршрутизация включена через "
+            f"<code>{html.escape(interface_label)}</code>.",
             keyboard=self._group_keyboard(),
         )
 
@@ -464,7 +534,7 @@ class BotApp:
             raise ValidationError("Подтверждение устарело.")
         if self.router.get_group(name) is not None:
             raise ValidationError("Список с таким именем уже существует.")
-        self._create_group(user_id, chat_id, name, entries)
+        self._choose_new_group_interface(user_id, chat_id)
 
     def _state_add_group_entries(self, user_id: int, chat_id: int, text: str) -> None:
         group = self._current_group(user_id)
@@ -713,6 +783,11 @@ class BotApp:
         if interface_value in {".", "-"}:
             interface_value = self.config.default_interface
         interface = normalize_interface(interface_value)
+        if interface not in self._interface_names():
+            raise ValidationError(
+                f"Интерфейс «{interface}» не найден. "
+                "Используйте /interfaces для выбора системного ID."
+            )
         exclusive = any(
             part.casefold() in {"exclusive", "эксклюзивный", "reject"}
             for part in parts[1:]
@@ -734,6 +809,7 @@ class BotApp:
             enabled=True,
         )
         self.router.save_dns_route(route)
+        self._ensure_dns_route_active(group.name, interface)
         self.sessions[user_id] = {"current_group": group.name}
         self.logger.info(
             "Telegram user_id=%s attached group=%r interface=%r exclusive=%s",
@@ -834,14 +910,24 @@ class BotApp:
 
     def _show_groups(self, user_id: int, chat_id: int) -> None:
         groups = self.router.list_groups()
+        routes_by_group: dict[str, list[DnsRoute]] = defaultdict(list)
+        for route in self.router.list_dns_routes():
+            routes_by_group[route.group].append(route)
         self.sessions[user_id].clear()
         rows: list[list[tuple[str, str]]] = []
         for index, group in enumerate(groups):
             display_name = group.description or group.name
+            linked = routes_by_group[group.name]
+            marker = (
+                "🟢" if linked and all(route.enabled for route in linked)
+                else "🟡" if any(route.enabled for route in linked)
+                else "⚪" if linked
+                else "⚠️"
+            )
             rows.append(
                 [
                     (
-                        f"🌐 {display_name} · {len(group.entries)}",
+                        f"{marker} {display_name} · {len(group.entries)}",
                         f"g:{index}",
                     )
                 ]
@@ -937,13 +1023,84 @@ class BotApp:
             )
             or "нет"
         )
+        state = (
+            "включена" if linked and all(route.enabled for route in linked)
+            else "частично включена" if any(route.enabled for route in linked)
+            else "выключена" if linked
+            else "нет правила"
+        )
         self._send(
             chat_id,
             f"<b>{html.escape(display_name)}</b>\n\n"
             f"Записей: <b>{len(group.entries)}</b>\n"
-            f"Правила: {links}",
+            f"Правила: {links}\n"
+            f"Маршрутизация: {state}",
             keyboard=self._group_keyboard(),
         )
+
+    def _toggle_group_dns_routes(self, user_id: int, chat_id: int) -> None:
+        group = self._current_group(user_id)
+        routes = [
+            route
+            for route in self.router.list_dns_routes()
+            if route.group == group.name
+        ]
+        if not routes:
+            raise ValidationError(
+                "У списка нет DNS-правила. Сначала создайте правило."
+            )
+        enabled = not all(route.enabled for route in routes)
+        self.router.set_dns_routes_enabled(
+            (route.index for route in routes), enabled
+        )
+        updated = [
+            route
+            for route in self.router.list_dns_routes()
+            if route.group == group.name
+        ]
+        if len(updated) != len(routes) or any(
+            route.enabled != enabled for route in updated
+        ):
+            raise RciError("Не удалось подтвердить состояние DNS-маршрутизации.")
+        self.logger.info(
+            "Telegram user_id=%s set FQDN group=%r routes=%s enabled=%s",
+            user_id,
+            group.name,
+            len(routes),
+            enabled,
+        )
+        self._send(
+            chat_id,
+            f"✅ Маршрутизация списка <b>{html.escape(group.description or group.name)}</b> "
+            f"{'включена' if enabled else 'выключена'} "
+            f"({len(routes)} правил).",
+            keyboard=self._group_keyboard(),
+        )
+
+    def _ensure_dns_route_active(self, group: str, interface: str) -> None:
+        matching = [
+            route
+            for route in self.router.list_dns_routes()
+            if route.group == group and route.interface == interface
+        ]
+        if not matching:
+            raise RciError(
+                f"Список «{group}» сохранён, но DNS-правило не появилось. "
+                "Проверьте маршрутизацию в Keenetic."
+            )
+        disabled = [route.index for route in matching if not route.enabled]
+        if disabled:
+            self.router.set_dns_routes_enabled(disabled, True)
+            matching = [
+                route
+                for route in self.router.list_dns_routes()
+                if route.group == group and route.interface == interface
+            ]
+        if not matching or any(not route.enabled for route in matching):
+            raise RciError(
+                f"DNS-правило списка «{group}» сохранено, но не включилось. "
+                "Проверьте маршрутизацию в Keenetic."
+            )
 
     def _show_group_entries(self, user_id: int, chat_id: int) -> None:
         group = self._current_group(user_id)
@@ -1713,8 +1870,10 @@ class BotApp:
             except TelegramError as exc:
                 if "message is not modified" in str(exc).casefold():
                     return
+                if "message to edit not found" not in str(exc).casefold():
+                    raise
                 self.logger.warning(
-                    "Could not edit Telegram message chat_id=%s message_id=%s: %s",
+                    "Telegram message disappeared chat_id=%s message_id=%s: %s",
                     chat_id,
                     message_id,
                     exc,
@@ -1723,6 +1882,46 @@ class BotApp:
         sent_message_id = int(result.get("message_id", 0))
         if sent_message_id:
             self.active_messages[chat_id] = sent_message_id
+            self._save_active_messages()
+
+    def _notify_error(self, chat_id: int, message: str) -> None:
+        self.telegram.send_message(chat_id, f"❌ {html.escape(message)}")
+
+    def _load_active_messages(self) -> None:
+        if not self.config.ui_state_file:
+            return
+        path = Path(self.config.ui_state_file)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self.active_messages = {
+                    int(chat_id): int(message_id)
+                    for chat_id, message_id in data.items()
+                    if int(message_id) > 0
+                }
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError) as exc:
+            self.logger.warning("Could not load Telegram UI state: %s", exc)
+
+    def _save_active_messages(self) -> None:
+        if not self.config.ui_state_file:
+            return
+        path = Path(self.config.ui_state_file)
+        temporary_path: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(
+                prefix=".ui_state-", suffix=".json", dir=path.parent
+            )
+            temporary_path = Path(name)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as state_file:
+                json.dump(self.active_messages, state_file)
+            os.replace(temporary_path, path)
+        except OSError as exc:
+            self.logger.warning("Could not save Telegram UI state: %s", exc)
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def _send_paginated_lines(
         self,
@@ -1839,6 +2038,7 @@ class BotApp:
                 ],
                 [("🧹 Убрать дубликаты", "groups_dedupe")],
                 [("🔗 Создать правило", "g_attach")],
+                [("⏯ Включить/выключить маршрутизацию", "g_toggle")],
                 [("🗑 Удалить список", "g_delete")],
                 [("← К спискам", "groups"), ("← Меню", "home")],
             ]

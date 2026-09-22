@@ -77,6 +77,12 @@ class TelegramClient:
         result = self.call("editMessageText", payload)
         return result if isinstance(result, dict) else {}
 
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        self.call(
+            "deleteMessage",
+            {"chat_id": chat_id, "message_id": message_id},
+        )
+
     def answer_callback_query(
         self,
         callback_query_id: str,

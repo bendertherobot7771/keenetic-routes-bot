@@ -131,6 +131,39 @@ class RciClientTests(unittest.TestCase):
             {"system": {"configuration": {"save": {}}}},
         )
 
+    def test_creates_group_with_enabled_dns_route_in_one_batch(self) -> None:
+        self.transport.get_responses[
+            "http://127.0.0.1:79/rci/show/sc/object-group/fqdn"
+        ] = {}
+
+        self.client.create_group_with_dns_route(
+            FqdnGroup("steam", "Steam", ("steampowered.com",)),
+            "Wireguard0",
+        )
+
+        payload = self.transport.calls[-1][2]
+        self.assertEqual(payload[0]["object-group"]["fqdn"]["steam"]["include"], [
+            {"address": "steampowered.com"}
+        ])
+        route = payload[1]["dns-proxy"]["route"]
+        self.assertEqual(route["group"], "steam")
+        self.assertEqual(route["interface"], "Wireguard0")
+        self.assertFalse(route["disable"])
+        self.assertEqual(payload[-1], {"system": {"configuration": {"save": {}}}})
+
+    def test_sets_multiple_dns_routes_enabled_in_one_batch(self) -> None:
+        self.client.set_dns_routes_enabled(["1", "2", "1"], False)
+
+        payload = self.transport.calls[-1][2]
+        self.assertEqual(
+            payload,
+            [
+                {"dns-proxy": {"route": {"disable": {"index": "1", "no": False}}}},
+                {"dns-proxy": {"route": {"disable": {"index": "2", "no": False}}}},
+                {"system": {"configuration": {"save": {}}}},
+            ],
+        )
+
     def test_adds_ipv4_route_in_native_shape(self) -> None:
         self.client.add_ipv4_routes(
             [

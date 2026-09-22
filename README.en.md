@@ -19,7 +19,8 @@ remain visible in the web UI and are saved through the standard
 
 ## Features
 
-- View, create, populate, and delete FQDN lists.
+- View, create, populate, and delete FQDN lists; creation requires choosing an
+  existing interface and adds an enabled DNS route.
 - Add and remove domains, IP addresses, and CIDRs in bulk: one per line or
   separated by spaces, commas, or `;`.
 - Find and remove requested domains across every FQDN list with a per-list report.
@@ -29,6 +30,7 @@ remain visible in the web UI and are saved through the standard
 - Show both the system ID and the real user-defined name of a DNS list in rules.
 - Show the number of DNS lists and their total number of entries.
 - Create, enable, disable, delete, and change the interface of native DNS rules.
+- Enable or disable all DNS routing for a list without deleting the list or rules.
 - Change the interface of DNS rules in bulk for selected or all linked FQDN
   lists at once.
 - Add and manage native IPv4 routes in bulk, including individual interface
@@ -40,6 +42,8 @@ remain visible in the web UI and are saved through the standard
 - Ask for confirmation before destructive actions.
 - Keep navigation, operation results, and long paginated lists in one edited
   Telegram message instead of filling the chat with new bot messages.
+- Delete successfully processed user text messages in private chats; keep
+  invalid input and send a separate error notification.
 - Restrict access to an allowlist of Telegram user IDs.
 - Start automatically with Entware after a router reboot.
 
@@ -113,7 +117,8 @@ The installer asks for:
 
 1. the BotFather token;
 2. allowed Telegram user IDs separated by commas;
-3. a default system interface ID, for example `u1Host`.
+3. optionally, an existing system interface ID such as `Wireguard0`, not its
+   user-defined name.
 
 Verify the installation:
 
@@ -137,10 +142,16 @@ allowlist, and RCI settings.
 BOT_TOKEN="1234567890:replace_me"
 ALLOWED_USERS="123456789,987654321"
 RCI_URL="http://127.0.0.1:79/rci"
-DEFAULT_INTERFACE="u1Host"
+DEFAULT_INTERFACE="Wireguard0"
 PRIVATE_CHATS_ONLY="true"
 MAX_GROUP_ENTRIES="300"
+UI_STATE_FILE="/opt/etc/keenetic-routes-bot/ui_state.json"
 ```
+
+`DEFAULT_INTERFACE` may be empty. New DNS lists always use an interface selected
+from Keenetic's current list. `UI_STATE_FILE` is optional; by default the bot
+stores the ID of its editable message there so it can keep using that message
+after a restart.
 
 The configuration survives normal upgrades and uninstalls. It is removed only
 by `uninstall.sh --purge`, storage cleanup, or Entware storage failure.
@@ -215,6 +226,13 @@ exists, is covered by an existing parent domain, or would itself cover an
 existing subdomain, the bot shows the conflicts and asks whether to continue or
 cancel the operation.
 
+A new DNS list is created only after choosing an interface from the current
+Keenetic interface list. One RCI batch creates the FQDN list and an enabled DNS
+route. The bot reads the route back and retries activation if needed. If Keenetic
+does not confirm an active route, the bot reports an error and the resulting
+list should be checked manually. Existing lists without rules are not changed
+automatically; open such a list and use **Create rule**.
+
 The **Remove duplicates** button in the DNS lists section scans every list. It
 shows how many entries would be removed before asking for confirmation. The
 cleanup:
@@ -251,6 +269,12 @@ DNS rules show both the system list name and its user-defined description, for
 example `domain-list0 (Social networks)`. Interfaces are shown throughout the
 bot as `Wireguard3 (fastVPS_Estonia)`.
 
+FQDN list markers show routing state: 🟢 all rules enabled, 🟡 some enabled,
+⚪ all disabled, and ⚠️ no rule. **Enable/disable routing** in a list card
+switches all its DNS rules in one batch without deleting the list or rules. A
+list without rules needs a rule first. Manual rule creation checks that the
+system interface ID exists and confirms that the route is active.
+
 The interface of an individual DNS rule can be changed from its details screen.
 The **Change interface selectively** button lets the user select multiple lists,
 choose a new interface, and update their linked DNS rules. The **Change
@@ -259,9 +283,14 @@ DNS routing rule. Both flows show the affected rule and list counts, require
 confirmation, and preserve rule state and the `exclusive` option.
 
 Menus, confirmations, and operation results are displayed by editing one
-message. Long results use **Back** and **Next** buttons instead of creating a
-chain of messages. A new message is sent only when the bot has no accessible
-message to edit, such as on first use or after the user deletes that message.
+message. The bot stores its message ID across restarts. Long results use **Back**
+and **Next** buttons instead of creating a chain of messages. A new message is
+sent when there is no accessible bot message to edit, such as on first use or
+after the user deletes it. Successfully processed user text messages in private
+chats are deleted. On processing or deletion errors, the bot sends a separate
+error message; failed input remains in the chat. Older chat history is not
+removed retroactively. [Telegram limits message deletion to 48
+hours](https://core.telegram.org/bots/api#deletemessage).
 
 ### IPv4 routes
 
@@ -274,9 +303,9 @@ CIDR INTERFACE description
 For example:
 
 ```text
-149.154.160.0/20 u1Host telegram
-91.108.4.0/22 u1Host telegram
-31.13.64.0/18 u1Host "social networks"
+149.154.160.0/20 Wireguard0 telegram
+91.108.4.0/22 Wireguard0 telegram
+31.13.64.0/18 Wireguard0 "social networks"
 ```
 
 If `DEFAULT_INTERFACE` is configured, the interface may be omitted.

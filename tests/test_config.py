@@ -23,6 +23,10 @@ class ConfigTests(unittest.TestCase):
             config = Config.from_env()
         self.assertEqual(config.allowed_users, frozenset({10, 20}))
         self.assertEqual(config.default_interface, "u1Host")
+        self.assertEqual(
+            config.ui_state_file,
+            "/opt/etc/keenetic-routes-bot/ui_state.json",
+        )
 
     def test_rejects_non_loopback_rci_by_default(self) -> None:
         with patch.dict(

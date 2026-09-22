@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from keenetic_routes_bot.app import BotApp
 from keenetic_routes_bot.config import Config
 from keenetic_routes_bot.models import DnsRoute, FqdnGroup, Interface, Ipv4Route
+from keenetic_routes_bot.telegram import TelegramError
 
 
 class FakeTelegram:
@@ -13,6 +17,9 @@ class FakeTelegram:
         self.sent_messages: list[tuple[int, str, object]] = []
         self.edited_messages: list[tuple[int, int, str, object]] = []
         self.answers: list[tuple[str, str, bool]] = []
+        self.deleted_messages: list[tuple[int, int]] = []
+        self.delete_error: TelegramError | None = None
+        self.edit_error: TelegramError | None = None
         self.next_message_id = 100
 
     def send_message(
@@ -40,6 +47,8 @@ class FakeTelegram:
         parse_mode="HTML",
         disable_web_page_preview=True,
     ):
+        if self.edit_error is not None:
+            raise self.edit_error
         self.messages.append((chat_id, text, reply_markup))
         self.edited_messages.append((chat_id, message_id, text, reply_markup))
         return {"message_id": message_id, "chat": {"id": chat_id}}
@@ -48,6 +57,11 @@ class FakeTelegram:
         self, callback_query_id: str, *, text: str = "", show_alert: bool = False
     ) -> None:
         self.answers.append((callback_query_id, text, show_alert))
+
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted_messages.append((chat_id, message_id))
 
 
 class FakeRouter:
@@ -74,6 +88,18 @@ class FakeRouter:
         self.groups = [item for item in self.groups if item.name != group.name]
         self.groups.append(group)
 
+    def create_group_with_dns_route(self, group, interface):
+        self.save_group(group, replace=False)
+        self.save_dns_route(
+            DnsRoute(
+                index=str(len(self.rules) + 1),
+                group=group.name,
+                interface=interface,
+                auto=True,
+                enabled=True,
+            )
+        )
+
     def delete_group(self, name):
         self.groups = [item for item in self.groups if item.name != name]
 
@@ -88,6 +114,16 @@ class FakeRouter:
             self.saved_dns_routes.append(route)
             self.rules = [item for item in self.rules if item.index != route.index]
             self.rules.append(route)
+
+    def set_dns_route_enabled(self, index, enabled):
+        self.set_dns_routes_enabled([index], enabled)
+
+    def set_dns_routes_enabled(self, indices, enabled):
+        selected = set(indices)
+        self.rules = [
+            replace(route, enabled=enabled) if route.index in selected else route
+            for route in self.rules
+        ]
 
     def list_ipv4_routes(self):
         return list(self.ipv4_routes)
@@ -142,6 +178,7 @@ class AppTests(unittest.TestCase):
             "message": {
                 "from": {"id": user_id},
                 "chat": {"id": user_id, "type": "private"},
+                "message_id": 20,
                 "text": text,
             },
         }
@@ -342,9 +379,66 @@ class AppTests(unittest.TestCase):
         self.assertIsNone(self.router.get_group("AI subdomains"))
 
         self.app.handle_update(self.callback_update("g_create_yes"))
+        self.assertIsNone(self.router.get_group("AI subdomains"))
+        self.app.handle_update(self.callback_update("gnewif:1"))
         created = self.router.get_group("AI subdomains")
         self.assertIsNotNone(created)
         self.assertEqual(created.entries, ("api.openai.com",))
+        self.assertTrue(self.router.rules[-1].enabled)
+        self.assertEqual(self.router.rules[-1].interface, "Wireguard3")
+
+    def test_new_group_requires_interface_and_creates_enabled_dns_rule(self) -> None:
+        self.app.handle_update(self.callback_update("group_new"))
+        self.app.handle_update(self.message_update("steam"))
+        self.app.handle_update(self.message_update("store.steampowered.com"))
+
+        self.assertIsNone(self.router.get_group("steam"))
+        self.assertIn("Выберите интерфейс", self.telegram.messages[-1][1])
+        self.app.handle_update(self.callback_update("gnewif:0"))
+
+        self.assertIsNotNone(self.router.get_group("steam"))
+        self.assertEqual(len(self.router.rules), 1)
+        self.assertTrue(self.router.rules[0].enabled)
+        self.assertEqual(self.router.rules[0].interface, "u1Host")
+        self.assertIn("Маршрутизация включена", self.telegram.messages[-1][1])
+
+    def test_new_group_reactivates_rule_if_router_created_it_disabled(self) -> None:
+        original_create = self.router.create_group_with_dns_route
+
+        def create_disabled(group, interface):
+            original_create(group, interface)
+            self.router.rules = [
+                replace(route, enabled=False) for route in self.router.rules
+            ]
+
+        self.router.create_group_with_dns_route = create_disabled
+        self.app.handle_update(self.callback_update("group_new"))
+        self.app.handle_update(self.message_update("steam"))
+        self.app.handle_update(self.message_update("store.steampowered.com"))
+        self.app.handle_update(self.callback_update("gnewif:0"))
+
+        self.assertTrue(self.router.rules[0].enabled)
+
+    def test_group_can_toggle_all_dns_routes_without_deleting(self) -> None:
+        self.router.rules = [
+            DnsRoute("1", "openai", interface="u1Host", enabled=True),
+            DnsRoute("2", "openai", interface="Wireguard3", enabled=True),
+        ]
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_toggle"))
+
+        self.assertTrue(all(not route.enabled for route in self.router.rules))
+        self.assertEqual(len(self.router.rules), 2)
+        self.app.handle_update(self.callback_update("g_toggle"))
+        self.assertTrue(all(route.enabled for route in self.router.rules))
+
+    def test_group_without_rule_requires_route_before_toggle(self) -> None:
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_toggle"))
+
+        self.assertIn("Сначала создайте правило", self.telegram.messages[-1][1])
 
     def test_deduplicates_domains_across_all_groups(self) -> None:
         self.router.groups = [
@@ -413,7 +507,7 @@ class AppTests(unittest.TestCase):
         keyboard = self.telegram.messages[-1][2]
         self.assertEqual(
             keyboard["inline_keyboard"][0][0]["text"],
-            "🌐 Мой настоящий список · 1",
+            "⚠️ Мой настоящий список · 1",
         )
         labels = [row[0]["text"] for row in keyboard["inline_keyboard"]]
         self.assertIn("🔎 Найти правило по домену", labels)
@@ -427,6 +521,40 @@ class AppTests(unittest.TestCase):
         self.assertEqual(keyboard[0][0]["text"], "📄 Показать домены")
         self.assertEqual(keyboard[1][0]["text"], "➕ Добавить домен")
         self.assertEqual(keyboard[1][1]["text"], "➖ Удалить домен")
+        self.assertIn(
+            "⏯ Включить/выключить маршрутизацию",
+            [row[0]["text"] for row in keyboard],
+        )
+
+    def test_group_list_marks_enabled_disabled_and_missing_rules(self) -> None:
+        self.router.groups = [
+            FqdnGroup("a", "Active"),
+            FqdnGroup("b", "Disabled"),
+            FqdnGroup("c", "Missing"),
+        ]
+        self.router.rules = [
+            DnsRoute("1", "a", interface="u1Host", enabled=True),
+            DnsRoute("2", "b", interface="u1Host", enabled=False),
+        ]
+        self.app.handle_update(self.callback_update("groups"))
+        labels = [
+            row[0]["text"]
+            for row in self.telegram.messages[-1][2]["inline_keyboard"][:3]
+        ]
+        self.assertEqual(
+            labels,
+            ["🟢 Active · 0", "⚪ Disabled · 0", "⚠️ Missing · 0"],
+        )
+
+    def test_rejects_nonexistent_interface_when_attaching_group(self) -> None:
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_attach"))
+        self.app.handle_update(self.message_update("UnknownInterface"))
+
+        self.assertFalse(self.router.saved_dns_routes)
+        self.assertFalse(self.telegram.deleted_messages)
+        self.assertIn("не найден", self.telegram.sent_messages[-1][1])
 
     def test_rules_show_group_and_interface_descriptions(self) -> None:
         self.router.groups = [
@@ -557,6 +685,49 @@ class AppTests(unittest.TestCase):
         self.assertEqual(len(self.telegram.sent_messages), 1)
         self.assertEqual(self.telegram.edited_messages[-1][1], 10)
         self.assertNotEqual(sent_message_id, 0)
+        self.assertEqual(self.telegram.deleted_messages, [(42, 20), (42, 20)])
+
+    def test_invalid_user_input_is_kept_and_reported_in_new_message(self) -> None:
+        self.app.handle_update(self.callback_update("group_new"))
+        sent_before = len(self.telegram.sent_messages)
+        self.app.handle_update(self.message_update(""))
+
+        self.assertFalse(self.telegram.deleted_messages)
+        self.assertEqual(len(self.telegram.sent_messages), sent_before + 1)
+        self.assertIn("❌", self.telegram.sent_messages[-1][1])
+
+    def test_delete_failure_reports_error_without_repeating_action(self) -> None:
+        self.telegram.delete_error = TelegramError("Telegram API: denied")
+        self.app.handle_update(self.message_update("/start"))
+
+        self.assertFalse(self.telegram.deleted_messages)
+        self.assertEqual(len(self.telegram.sent_messages), 2)
+        self.assertIn("Данные обработаны", self.telegram.sent_messages[-1][1])
+
+    def test_active_message_survives_bot_restart(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = replace(
+                self.config,
+                ui_state_file=str(Path(directory) / "ui_state.json"),
+            )
+            first = BotApp(config, self.telegram, self.router)
+            first.handle_update(self.message_update("/start"))
+            message_id = first.active_messages[42]
+
+            second = BotApp(config, self.telegram, self.router)
+            second.handle_update(self.message_update("/help"))
+
+        self.assertEqual(len(self.telegram.sent_messages), 1)
+        self.assertEqual(self.telegram.edited_messages[-1][1], message_id)
+
+    def test_transient_edit_error_does_not_create_replacement_panel(self) -> None:
+        self.app.handle_update(self.message_update("/start"))
+        self.telegram.edit_error = TelegramError("Telegram API недоступен")
+
+        with self.assertRaises(TelegramError):
+            self.app.handle_update(self.callback_update("groups"))
+
+        self.assertEqual(len(self.telegram.sent_messages), 1)
 
     def test_long_output_uses_pages_in_the_same_message(self) -> None:
         self.router.groups = [

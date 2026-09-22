@@ -50,7 +50,7 @@ def normalize_interface(value: str) -> str:
     interface = value.strip()
     if not _INTERFACE_RE.fullmatch(interface):
         raise ValidationError(
-            "Некорректный системный идентификатор интерфейса. Пример: u1Host."
+            "Некорректный системный идентификатор интерфейса. Пример: Wireguard0."
         )
     return interface
 

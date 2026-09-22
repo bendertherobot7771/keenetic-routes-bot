@@ -61,9 +61,8 @@ if [ ! -f "$CONFIG_FILE" ]; then
     printf "\n"
     printf "Allowed Telegram user IDs (comma-separated): "
     IFS= read -r ALLOWED_USERS_INPUT
-    printf "Default Keenetic interface ID [u1Host]: "
+    printf "Default Keenetic interface ID (leave empty if unsure): "
     IFS= read -r DEFAULT_INTERFACE_INPUT
-    DEFAULT_INTERFACE_INPUT="${DEFAULT_INTERFACE_INPUT:-u1Host}"
     umask 077
     {
         printf 'BOT_TOKEN="%s"\n' "$BOT_TOKEN_INPUT"
@@ -76,6 +75,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
         printf 'PRIVATE_CHATS_ONLY="true"\n'
         printf 'LOG_LEVEL="INFO"\n'
         printf 'LOG_FILE="/opt/var/log/keenetic-routes-bot.log"\n'
+        printf 'UI_STATE_FILE="/opt/etc/keenetic-routes-bot/ui_state.json"\n'
         printf 'POLL_TIMEOUT="25"\n'
         printf 'REQUEST_TIMEOUT="15"\n'
         printf 'MAX_GROUP_ENTRIES="300"\n'

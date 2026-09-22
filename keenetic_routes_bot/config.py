@@ -44,6 +44,7 @@ class Config:
     default_interface: str = ""
     log_level: int = logging.INFO
     log_file: str = ""
+    ui_state_file: str = ""
     private_chats_only: bool = True
     poll_timeout: int = 25
     request_timeout: int = 15
@@ -85,6 +86,10 @@ class Config:
             default_interface=default_interface,
             log_level=log_level,
             log_file=os.getenv("LOG_FILE", "").strip(),
+            ui_state_file=os.getenv(
+                "UI_STATE_FILE",
+                "/opt/etc/keenetic-routes-bot/ui_state.json",
+            ).strip(),
             private_chats_only=_parse_bool(os.getenv("PRIVATE_CHATS_ONLY", "true")),
             poll_timeout=_parse_int("POLL_TIMEOUT", 25, minimum=5, maximum=50),
             request_timeout=_parse_int("REQUEST_TIMEOUT", 15, minimum=3, maximum=120),
