@@ -483,6 +483,49 @@ class AppTests(unittest.TestCase):
         self.assertIn("не найдены", self.telegram.messages[-1][1])
         self.assertFalse(self.router.saved_groups)
 
+    def test_group_selection_survives_list_change_after_menu(self) -> None:
+        self.router.groups = [FqdnGroup("b-list", "B", ("b.example",))]
+        self.app.handle_update(self.callback_update("groups"))
+        self.router.groups.insert(0, FqdnGroup("a-list", "A", ("a.example",)))
+        self.app.handle_update(self.callback_update("g:0"))
+
+        self.assertEqual(self.app.sessions[42]["current_group"], "b-list")
+        self.assertIn("<b>B</b>", self.telegram.messages[-1][1])
+
+    def test_group_selection_reports_deleted_group(self) -> None:
+        self.app.handle_update(self.callback_update("groups"))
+        self.router.groups = []
+        self.app.handle_update(self.callback_update("g:0"))
+
+        self.assertIn("больше не существует", self.telegram.messages[-1][1])
+
+    def test_selection_without_shown_menu_is_rejected(self) -> None:
+        self.app.handle_update(self.callback_update("g:0"))
+
+        self.assertIn("Список устарел", self.telegram.messages[-1][1])
+
+    def test_rule_selection_survives_list_change_after_menu(self) -> None:
+        self.router.rules = [DnsRoute("2", "openai", interface="Wireguard3")]
+        self.app.handle_update(self.callback_update("rules"))
+        self.router.rules.insert(0, DnsRoute("1", "openai", interface="u1Host"))
+        self.app.handle_update(self.callback_update("r:0"))
+
+        self.assertEqual(self.app.sessions[42]["current_rule"], "2")
+        self.assertIn("Wireguard3", self.telegram.messages[-1][1])
+
+    def test_ipv4_selection_survives_list_change_after_menu(self) -> None:
+        self.router.ipv4_routes = [
+            Ipv4Route("2", "91.108.4.0/22", interface="u1Host")
+        ]
+        self.app.handle_update(self.callback_update("routes"))
+        self.router.ipv4_routes.insert(
+            0, Ipv4Route("1", "149.154.160.0/20", interface="u1Host")
+        )
+        self.app.handle_update(self.callback_update("ip:0"))
+
+        self.assertEqual(self.app.sessions[42]["current_ipv4_route"], "2")
+        self.assertIn("91.108.4.0/22", self.telegram.messages[-1][1])
+
     def test_refuses_group_delete_when_rule_uses_it(self) -> None:
         self.router.rules = [DnsRoute("1", "openai", interface="u1Host", auto=True)]
         self.app.handle_update(self.callback_update("groups"))

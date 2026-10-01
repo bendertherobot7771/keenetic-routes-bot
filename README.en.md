@@ -292,6 +292,12 @@ error message; failed input remains in the chat. Older chat history is not
 removed retroactively. [Telegram limits message deletion to 48
 hours](https://core.telegram.org/bots/api#deletemessage).
 
+Buttons in the FQDN list, DNS rule, and IPv4 route menus are bound to the
+specific object that was shown, not to its position. If the list changes in the
+web interface after the menu is displayed, the bot still opens the selected
+object; if it has been deleted, the bot reports that. Selection buttons from a
+menu shown before a bot restart stop working: open the section again.
+
 ### IPv4 routes
 
 Use one line per route:

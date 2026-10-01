@@ -913,7 +913,9 @@ class BotApp:
         routes_by_group: dict[str, list[DnsRoute]] = defaultdict(list)
         for route in self.router.list_dns_routes():
             routes_by_group[route.group].append(route)
-        self.sessions[user_id].clear()
+        self.sessions[user_id] = {
+            "group_choices": tuple(group.name for group in groups)
+        }
         rows: list[list[tuple[str, str]]] = []
         for index, group in enumerate(groups):
             display_name = group.description or group.name
@@ -1007,7 +1009,10 @@ class BotApp:
         )
 
     def _select_group(self, user_id: int, chat_id: int, index: int) -> None:
-        group = self.router.list_groups()[index]
+        name = self._session_choice(user_id, "group_choices", index)
+        group = self.router.get_group(name)
+        if group is None:
+            raise ValidationError("Список больше не существует.")
         self.sessions[user_id] = {"current_group": group.name}
         display_name = group.description or group.name
         linked = [
@@ -1163,7 +1168,9 @@ class BotApp:
         rules = self.router.list_dns_routes()
         groups = {group.name: group for group in self.router.list_groups()}
         interface_names = self._interface_names()
-        self.sessions[user_id].clear()
+        self.sessions[user_id] = {
+            "rule_choices": tuple(route.index for route in rules)
+        }
         rows: list[list[tuple[str, str]]] = []
         for position, route in enumerate(rules):
             marker = "🟢" if route.enabled else "⚪"
@@ -1185,12 +1192,11 @@ class BotApp:
         )
 
     def _select_rule(self, user_id: int, chat_id: int, position: int) -> None:
-        route = self.router.list_dns_routes()[position]
-        groups = {group.name: group for group in self.router.list_groups()}
         self.sessions[user_id] = {
-            "current_rule": route.index,
-            "current_rule_group": route.group,
+            "current_rule": self._session_choice(user_id, "rule_choices", position)
         }
+        route = self._current_rule(user_id)
+        groups = {group.name: group for group in self.router.list_groups()}
         target = self._format_route_target(route, self._interface_names())
         group_label = self._format_group_name(route.group, groups)
         self._send(
@@ -1256,7 +1262,9 @@ class BotApp:
     def _show_ipv4_routes(self, user_id: int, chat_id: int) -> None:
         routes = self.router.list_ipv4_routes()
         interface_names = self._interface_names()
-        self.sessions[user_id].clear()
+        self.sessions[user_id] = {
+            "ipv4_choices": tuple(route.index for route in routes)
+        }
         rows: list[list[tuple[str, str]]] = []
         for position, route in enumerate(routes[:90]):
             marker = "🟢" if route.enabled else "⚪"
@@ -1291,8 +1299,12 @@ class BotApp:
         )
 
     def _select_ipv4_route(self, user_id: int, chat_id: int, position: int) -> None:
-        route = self.router.list_ipv4_routes()[position]
-        self.sessions[user_id] = {"current_ipv4_route": route.index}
+        self.sessions[user_id] = {
+            "current_ipv4_route": self._session_choice(
+                user_id, "ipv4_choices", position
+            )
+        }
+        route = self._current_ipv4_route(user_id)
         target = self._format_route_target(route, self._interface_names())
         self._send(
             chat_id,
@@ -1383,6 +1395,12 @@ class BotApp:
             f"<b>{html.escape(title)}</b>",
             keyboard=inline_keyboard(rows),
         )
+
+    def _session_choice(self, user_id: int, key: str, position: int) -> str:
+        choices = tuple(self.sessions[user_id].get(key, ()))
+        if position < 0 or position >= len(choices):
+            raise ValidationError("Список устарел. Откройте раздел заново.")
+        return str(choices[position])
 
     def _selected_interface(self, user_id: int, position: int) -> str:
         choices = tuple(self.sessions[user_id].get("interface_choices", ()))
