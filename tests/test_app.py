@@ -139,6 +139,12 @@ class FakeRouter:
             ]
             self.ipv4_routes.append(route)
 
+    def set_ipv4_route_enabled(self, index, enabled):
+        self.ipv4_routes = [
+            replace(route, enabled=enabled) if route.index == index else route
+            for route in self.ipv4_routes
+        ]
+
     def delete_ipv4_route(self, index):
         self.delete_ipv4_routes([index])
 
@@ -650,6 +656,46 @@ class AppTests(unittest.TestCase):
 
         self.app.handle_update(self.callback_update("ip:119"))
         self.assertIn("10.119.0.0/16", self.telegram.messages[-1][1])
+
+    def test_toggles_one_dns_rule_and_confirms_state(self) -> None:
+        self.router.rules = [DnsRoute("1", "openai", interface="u1Host", enabled=True)]
+        self.app.handle_update(self.callback_update("rules"))
+        self.app.handle_update(self.callback_update("r:0"))
+        self.app.handle_update(self.callback_update("r_toggle"))
+
+        self.assertFalse(self.router.rules[0].enabled)
+        self.assertIn("Правило выключено", self.telegram.messages[-1][1])
+
+    def test_reports_dns_rule_toggle_not_applied_by_router(self) -> None:
+        self.router.rules = [DnsRoute("1", "openai", interface="u1Host", enabled=True)]
+        self.router.set_dns_routes_enabled = lambda indices, enabled: None
+        self.app.handle_update(self.callback_update("rules"))
+        self.app.handle_update(self.callback_update("r:0"))
+        self.app.handle_update(self.callback_update("r_toggle"))
+
+        self.assertIn("Не удалось подтвердить", self.telegram.messages[-1][1])
+
+    def test_toggles_one_ipv4_route_and_confirms_state(self) -> None:
+        self.router.ipv4_routes = [
+            Ipv4Route("7", "149.154.160.0/20", interface="u1Host", enabled=False)
+        ]
+        self.app.handle_update(self.callback_update("routes"))
+        self.app.handle_update(self.callback_update("ip:0"))
+        self.app.handle_update(self.callback_update("ip_toggle"))
+
+        self.assertTrue(self.router.ipv4_routes[0].enabled)
+        self.assertIn("Маршрут включён", self.telegram.messages[-1][1])
+
+    def test_reports_ipv4_route_toggle_not_applied_by_router(self) -> None:
+        self.router.ipv4_routes = [
+            Ipv4Route("7", "149.154.160.0/20", interface="u1Host", enabled=False)
+        ]
+        self.router.set_ipv4_route_enabled = lambda index, enabled: None
+        self.app.handle_update(self.callback_update("routes"))
+        self.app.handle_update(self.callback_update("ip:0"))
+        self.app.handle_update(self.callback_update("ip_toggle"))
+
+        self.assertIn("Не удалось подтвердить", self.telegram.messages[-1][1])
 
     def test_changes_interface_for_one_dns_rule(self) -> None:
         self.router.rules = [DnsRoute("1", "openai", interface="u1Host")]

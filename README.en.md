@@ -273,7 +273,9 @@ FQDN list markers show routing state: 🟢 all rules enabled, 🟡 some enabled,
 ⚪ all disabled, and ⚠️ no rule. **Enable/disable routing** in a list card
 switches all its DNS rules in one batch without deleting the list or rules. A
 list without rules needs a rule first. Manual rule creation checks that the
-system interface ID exists and confirms that the route is active.
+system interface ID exists and confirms that the route is active. When a single
+DNS rule or IPv4 route is enabled or disabled, the bot reads its state back and
+reports an error if Keenetic did not apply the change.
 
 The interface of an individual DNS rule can be changed from its details screen.
 The **Change interface selectively** button lets the user select multiple lists,

@@ -1218,6 +1218,12 @@ class BotApp:
     def _toggle_rule(self, user_id: int, chat_id: int) -> None:
         route = self._current_rule(user_id)
         self.router.set_dns_route_enabled(route.index, not route.enabled)
+        updated = next(
+            (item for item in self.router.list_dns_routes() if item.index == route.index),
+            None,
+        )
+        if updated is None or updated.enabled == route.enabled:
+            raise RciError("Не удалось подтвердить состояние DNS-правила.")
         self.logger.info(
             "Telegram user_id=%s toggled DNS rule index=%r enabled=%s",
             user_id,
@@ -1338,6 +1344,12 @@ class BotApp:
     def _toggle_ipv4_route(self, user_id: int, chat_id: int) -> None:
         route = self._current_ipv4_route(user_id)
         self.router.set_ipv4_route_enabled(route.index, not route.enabled)
+        updated = next(
+            (item for item in self.router.list_ipv4_routes() if item.index == route.index),
+            None,
+        )
+        if updated is None or updated.enabled == route.enabled:
+            raise RciError("Не удалось подтвердить состояние IPv4-маршрута.")
         self.logger.info(
             "Telegram user_id=%s toggled IPv4 route index=%r enabled=%s",
             user_id,
