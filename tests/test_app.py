@@ -489,6 +489,74 @@ class AppTests(unittest.TestCase):
         self.assertIn("не найдены", self.telegram.messages[-1][1])
         self.assertFalse(self.router.saved_groups)
 
+    def test_dns_groups_list_is_paginated_and_every_group_selectable(self) -> None:
+        self.router.groups = [
+            FqdnGroup(f"list-{index:03d}", f"List {index:03d}", ("a.example",))
+            for index in range(120)
+        ]
+
+        self.app.handle_update(self.callback_update("groups"))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertIn("Всего: 120", text)
+        self.assertIn("Страница 1/3", text)
+        rows = keyboard["inline_keyboard"]
+        self.assertEqual(rows[49][0]["callback_data"], "g:49")
+        self.assertEqual(rows[50][0]["callback_data"], "groups_page:1")
+        self.assertEqual(rows[51][0]["callback_data"], "group_new")
+
+        self.app.handle_update(self.callback_update("groups_page:2"))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertIn("Страница 3/3", text)
+        rows = keyboard["inline_keyboard"]
+        self.assertEqual(rows[0][0]["callback_data"], "g:100")
+        self.assertEqual(rows[20][0]["callback_data"], "groups_page:1")
+
+        self.app.handle_update(self.callback_update("g:119"))
+        self.assertEqual(self.app.sessions[42]["current_group"], "list-119")
+
+    def test_dns_groups_list_has_no_navigation_on_single_page(self) -> None:
+        self.app.handle_update(self.callback_update("groups"))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertNotIn("Страница", text)
+        callbacks = [
+            button["callback_data"]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ]
+        self.assertFalse(any(data.startswith("groups_page:") for data in callbacks))
+
+    def test_bulk_dns_selection_is_paginated_and_keeps_page_on_toggle(self) -> None:
+        self.router.groups = [
+            FqdnGroup(f"list-{index:03d}", f"List {index:03d}", ("a.example",))
+            for index in range(60)
+        ]
+        self.router.rules = [
+            DnsRoute(str(index), f"list-{index:03d}", interface="u1Host")
+            for index in range(60)
+        ]
+
+        self.app.handle_update(self.callback_update("groups_interfaces"))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertIn("Страница 1/2", text)
+        self.assertEqual(
+            keyboard["inline_keyboard"][50][0]["callback_data"], "dgb_page:1"
+        )
+
+        self.app.handle_update(self.callback_update("dgb_page:1"))
+        self.app.handle_update(self.callback_update("dgb:55"))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertIn("Страница 2/2", text)
+        rows = keyboard["inline_keyboard"]
+        self.assertEqual(rows[5][0]["text"], "☑️ list-055 (List 055)")
+        self.assertIn("Продолжить (1)", [row[0]["text"] for row in rows])
+
+        self.app.handle_update(self.callback_update("dgb_done"))
+        self.app.handle_update(self.callback_update("dgbif:1"))
+        self.app.handle_update(self.callback_update("dgb_apply"))
+        self.assertEqual(
+            [route.group for route in self.router.saved_dns_routes], ["list-055"]
+        )
+
     def test_group_selection_survives_list_change_after_menu(self) -> None:
         self.router.groups = [FqdnGroup("b-list", "B", ("b.example",))]
         self.app.handle_update(self.callback_update("groups"))

@@ -270,7 +270,8 @@ example `domain-list0 (Social networks)`. Interfaces are shown throughout the
 bot as `Wireguard3 (fastVPS_Estonia)`.
 
 FQDN list markers show routing state: 🟢 all rules enabled, 🟡 some enabled,
-⚪ all disabled, and ⚠️ no rule. **Enable/disable routing** in a list card
+⚪ all disabled, and ⚠️ no rule. Lists are shown 50 per page with **Back** and
+**Next** buttons. **Enable/disable routing** in a list card
 switches all its DNS rules in one batch without deleting the list or rules. A
 list without rules needs a rule first. Manual rule creation checks that the
 system interface ID exists and confirms that the route is active. When a single
@@ -278,8 +279,9 @@ DNS rule or IPv4 route is enabled or disabled, the bot reads its state back and
 reports an error if Keenetic did not apply the change.
 
 The interface of an individual DNS rule can be changed from its details screen.
-The **Change interface selectively** button lets the user select multiple lists,
-choose a new interface, and update their linked DNS rules. The **Change
+The **Change interface selectively** button lets the user select multiple lists
+(also 50 per page; selections are kept when switching pages), choose a new
+interface, and update their linked DNS rules. The **Change
 interface in all lists** button immediately selects every FQDN list that has a
 DNS routing rule. Both flows show the affected rule and list counts, require
 confirmation, and preserve rule state and the `exclusive` option.

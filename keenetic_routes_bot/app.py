@@ -29,7 +29,7 @@ from .validation import (
     remove_entries,
 )
 
-IPV4_ROUTES_PER_PAGE = 50
+ITEMS_PER_PAGE = 50
 
 
 class BotApp:
@@ -228,6 +228,10 @@ class BotApp:
                 self._show_interfaces(chat_id)
             elif callback_data == "groups":
                 self._show_groups(user_id, chat_id)
+            elif callback_data.startswith("groups_page:"):
+                self._show_groups(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
             elif callback_data == "group_new":
                 self.sessions[user_id] = {"action": "create_group_name"}
                 self._send(
@@ -244,6 +248,10 @@ class BotApp:
                 self._start_dns_all_interface_selection(user_id, chat_id)
             elif callback_data.startswith("dgb:"):
                 self._toggle_dns_bulk_group(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
+            elif callback_data.startswith("dgb_page:"):
+                self._show_dns_bulk_group_page(
                     user_id, chat_id, int(callback_data.split(":", 1)[1])
                 )
             elif callback_data == "dgb_all":
@@ -914,7 +922,7 @@ class BotApp:
             final_keyboard=inline_keyboard([[("← Меню", "home")]]),
         )
 
-    def _show_groups(self, user_id: int, chat_id: int) -> None:
+    def _show_groups(self, user_id: int, chat_id: int, page: int = 0) -> None:
         groups = self.router.list_groups()
         routes_by_group: dict[str, list[DnsRoute]] = defaultdict(list)
         for route in self.router.list_dns_routes():
@@ -922,8 +930,11 @@ class BotApp:
         self.sessions[user_id] = {
             "group_choices": tuple(group.name for group in groups)
         }
+        page, page_count, start = self._page_bounds(len(groups), page)
         rows: list[list[tuple[str, str]]] = []
-        for index, group in enumerate(groups):
+        for index, group in enumerate(
+            groups[start : start + ITEMS_PER_PAGE], start=start
+        ):
             display_name = group.description or group.name
             linked = routes_by_group[group.name]
             marker = (
@@ -940,6 +951,7 @@ class BotApp:
                     )
                 ]
             )
+        rows.extend(self._page_navigation(page, page_count, "groups_page"))
         rows.extend(
             [
                 [("➕ Новый список", "group_new")],
@@ -958,7 +970,8 @@ class BotApp:
         )
         self._send(
             chat_id,
-            f"<b>DNS-списки</b>\n\nВсего: {len(groups)}",
+            f"<b>DNS-списки</b>\n\nВсего: {len(groups)}"
+            f"{self._page_suffix(page, page_count)}",
             keyboard=inline_keyboard(rows),
         )
 
@@ -1277,12 +1290,10 @@ class BotApp:
         self.sessions[user_id] = {
             "ipv4_choices": tuple(route.index for route in routes)
         }
-        page_count = max(1, -(-len(routes) // IPV4_ROUTES_PER_PAGE))
-        page = min(max(page, 0), page_count - 1)
-        start = page * IPV4_ROUTES_PER_PAGE
+        page, page_count, start = self._page_bounds(len(routes), page)
         rows: list[list[tuple[str, str]]] = []
         for position, route in enumerate(
-            routes[start : start + IPV4_ROUTES_PER_PAGE], start=start
+            routes[start : start + ITEMS_PER_PAGE], start=start
         ):
             marker = "🟢" if route.enabled else "⚪"
             target = self._format_route_target(route, interface_names)
@@ -1295,13 +1306,7 @@ class BotApp:
                     )
                 ]
             )
-        navigation: list[tuple[str, str]] = []
-        if page > 0:
-            navigation.append(("← Назад", f"routes_page:{page - 1}"))
-        if page + 1 < page_count:
-            navigation.append(("Далее →", f"routes_page:{page + 1}"))
-        if navigation:
-            rows.append(navigation)
+        rows.extend(self._page_navigation(page, page_count, "routes_page"))
         rows.extend(
             [
                 [("➕ Добавить", "route_add")],
@@ -1315,10 +1320,10 @@ class BotApp:
                 [("← Меню", "home")],
             ]
         )
-        suffix = f"\nСтраница {page + 1}/{page_count}." if page_count > 1 else ""
         self._send(
             chat_id,
-            f"<b>Пользовательские IPv4-маршруты</b>\n\nВсего: {len(routes)}{suffix}",
+            f"<b>Пользовательские IPv4-маршруты</b>\n\nВсего: {len(routes)}"
+            f"{self._page_suffix(page, page_count)}",
             keyboard=inline_keyboard(rows),
         )
 
@@ -1426,6 +1431,27 @@ class BotApp:
             keyboard=inline_keyboard(rows),
         )
 
+    @staticmethod
+    def _page_bounds(total: int, page: int) -> tuple[int, int, int]:
+        page_count = max(1, -(-total // ITEMS_PER_PAGE))
+        page = min(max(page, 0), page_count - 1)
+        return page, page_count, page * ITEMS_PER_PAGE
+
+    @staticmethod
+    def _page_navigation(
+        page: int, page_count: int, callback_prefix: str
+    ) -> list[list[tuple[str, str]]]:
+        navigation: list[tuple[str, str]] = []
+        if page > 0:
+            navigation.append(("← Назад", f"{callback_prefix}:{page - 1}"))
+        if page + 1 < page_count:
+            navigation.append(("Далее →", f"{callback_prefix}:{page + 1}"))
+        return [navigation] if navigation else []
+
+    @staticmethod
+    def _page_suffix(page: int, page_count: int) -> str:
+        return f"\nСтраница {page + 1}/{page_count}." if page_count > 1 else ""
+
     def _session_choice(self, user_id: int, key: str, position: int) -> str:
         choices = tuple(self.sessions[user_id].get(key, ()))
         if position < 0 or position >= len(choices):
@@ -1532,8 +1558,14 @@ class BotApp:
         group_names = tuple(self.sessions[user_id].get("dns_bulk_groups", ()))
         selected = set(self.sessions[user_id].get("dns_bulk_selected", ()))
         groups = {group.name: group for group in self.router.list_groups()}
+        page, page_count, start = self._page_bounds(
+            len(group_names), int(self.sessions[user_id].get("dns_bulk_page", 0))
+        )
+        self.sessions[user_id]["dns_bulk_page"] = page
         rows: list[list[tuple[str, str]]] = []
-        for position, name in enumerate(group_names):
+        for position, name in enumerate(
+            group_names[start : start + ITEMS_PER_PAGE], start=start
+        ):
             marker = "☑️" if name in selected else "⬜"
             rows.append(
                 [
@@ -1543,6 +1575,7 @@ class BotApp:
                     )
                 ]
             )
+        rows.extend(self._page_navigation(page, page_count, "dgb_page"))
         rows.extend(
             [
                 [("Выбрать все", "dgb_all")],
@@ -1553,7 +1586,8 @@ class BotApp:
         self._send(
             chat_id,
             "<b>Массовая смена интерфейса DNS</b>\n\n"
-            "Выберите списки, для правил которых нужно сменить интерфейс.",
+            "Выберите списки, для правил которых нужно сменить интерфейс."
+            f"{self._page_suffix(page, page_count)}",
             keyboard=inline_keyboard(rows),
         )
 
@@ -1570,6 +1604,14 @@ class BotApp:
         else:
             selected.add(name)
         self.sessions[user_id]["dns_bulk_selected"] = list(selected)
+        self._show_dns_bulk_group_selection(user_id, chat_id)
+
+    def _show_dns_bulk_group_page(
+        self, user_id: int, chat_id: int, page: int
+    ) -> None:
+        if not self.sessions[user_id].get("dns_bulk_groups"):
+            raise ValidationError("Список DNS-групп устарел.")
+        self.sessions[user_id]["dns_bulk_page"] = page
         self._show_dns_bulk_group_selection(user_id, chat_id)
 
     def _select_all_dns_bulk_groups(self, user_id: int, chat_id: int) -> None:
