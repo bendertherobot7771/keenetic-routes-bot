@@ -29,6 +29,8 @@ from .validation import (
     remove_entries,
 )
 
+IPV4_ROUTES_PER_PAGE = 50
+
 
 class BotApp:
     def __init__(
@@ -367,6 +369,10 @@ class BotApp:
                 self._confirm_rule_delete(user_id, chat_id)
             elif callback_data == "routes":
                 self._show_ipv4_routes(user_id, chat_id)
+            elif callback_data.startswith("routes_page:"):
+                self._show_ipv4_routes(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
+                )
             elif callback_data == "routes_interfaces":
                 self._show_ipv4_description_choices(user_id, chat_id)
             elif callback_data == "routes_delete_descriptions":
@@ -1259,14 +1265,19 @@ class BotApp:
             ),
         )
 
-    def _show_ipv4_routes(self, user_id: int, chat_id: int) -> None:
+    def _show_ipv4_routes(self, user_id: int, chat_id: int, page: int = 0) -> None:
         routes = self.router.list_ipv4_routes()
         interface_names = self._interface_names()
         self.sessions[user_id] = {
             "ipv4_choices": tuple(route.index for route in routes)
         }
+        page_count = max(1, -(-len(routes) // IPV4_ROUTES_PER_PAGE))
+        page = min(max(page, 0), page_count - 1)
+        start = page * IPV4_ROUTES_PER_PAGE
         rows: list[list[tuple[str, str]]] = []
-        for position, route in enumerate(routes[:90]):
+        for position, route in enumerate(
+            routes[start : start + IPV4_ROUTES_PER_PAGE], start=start
+        ):
             marker = "🟢" if route.enabled else "⚪"
             target = self._format_route_target(route, interface_names)
             description = route.comment or "без описания"
@@ -1278,6 +1289,13 @@ class BotApp:
                     )
                 ]
             )
+        navigation: list[tuple[str, str]] = []
+        if page > 0:
+            navigation.append(("← Назад", f"routes_page:{page - 1}"))
+        if page + 1 < page_count:
+            navigation.append(("Далее →", f"routes_page:{page + 1}"))
+        if navigation:
+            rows.append(navigation)
         rows.extend(
             [
                 [("➕ Добавить", "route_add")],
@@ -1291,7 +1309,7 @@ class BotApp:
                 [("← Меню", "home")],
             ]
         )
-        suffix = "\nПоказаны первые 90." if len(routes) > 90 else ""
+        suffix = f"\nСтраница {page + 1}/{page_count}." if page_count > 1 else ""
         self._send(
             chat_id,
             f"<b>Пользовательские IPv4-маршруты</b>\n\nВсего: {len(routes)}{suffix}",

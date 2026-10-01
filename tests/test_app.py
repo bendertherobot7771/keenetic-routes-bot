@@ -629,6 +629,28 @@ class AppTests(unittest.TestCase):
         self.assertIn("Wireguard3 (fastVPS_Estonia)", label)
         self.assertIn("telegram", label)
 
+    def test_ipv4_routes_list_is_paginated_and_every_route_selectable(self) -> None:
+        self.router.ipv4_routes = [
+            Ipv4Route(str(index), f"10.{index}.0.0/16", interface="u1Host")
+            for index in range(120)
+        ]
+
+        self.app.handle_update(self.callback_update("routes"))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertIn("Страница 1/3", text)
+        rows = keyboard["inline_keyboard"]
+        self.assertEqual(rows[50][0]["callback_data"], "routes_page:1")
+
+        self.app.handle_update(self.callback_update("routes_page:2"))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertIn("Страница 3/3", text)
+        rows = keyboard["inline_keyboard"]
+        self.assertEqual(rows[0][0]["callback_data"], "ip:100")
+        self.assertEqual(rows[20][0]["callback_data"], "routes_page:1")
+
+        self.app.handle_update(self.callback_update("ip:119"))
+        self.assertIn("10.119.0.0/16", self.telegram.messages[-1][1])
+
     def test_changes_interface_for_one_dns_rule(self) -> None:
         self.router.rules = [DnsRoute("1", "openai", interface="u1Host")]
         self.app.handle_update(self.callback_update("rules"))

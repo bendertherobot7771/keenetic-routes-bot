@@ -317,8 +317,9 @@ For example:
 If `DEFAULT_INTERFACE` is configured, the interface may be omitted.
 
 The route list and details screen show the CIDR, the system interface ID with
-its user-defined name, and Keenetic's **Description** field. An individual
-route's interface can be changed from its details screen.
+its user-defined name, and Keenetic's **Description** field. The list shows 50
+routes per page with **Back** and **Next** buttons, so every route can be
+opened. An individual route's interface can be changed from its details screen.
 
 The **Change interface by description** button lists unique non-empty route
 descriptions and their route counts. After choosing a description and a new
