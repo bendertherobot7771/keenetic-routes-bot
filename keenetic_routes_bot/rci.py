@@ -83,7 +83,12 @@ class KeeneticRciClient:
         self._write(queries)
 
     def create_group_with_dns_route(
-        self, group: FqdnGroup, interface: str
+        self,
+        group: FqdnGroup,
+        interface: str,
+        *,
+        auto: bool = True,
+        exclusive: bool = False,
     ) -> None:
         if self.get_group(group.name) is not None:
             raise RciError("DNS-список с таким именем уже существует.")
@@ -106,7 +111,8 @@ class KeeneticRciClient:
                         index="",
                         group=group.name,
                         interface=interface,
-                        auto=True,
+                        auto=auto or exclusive,
+                        reject=exclusive,
                         enabled=True,
                     ).to_rci(include_index=False),
                 },

@@ -38,7 +38,8 @@ remain visible in the web UI and are saved through the standard
 - Delete IPv4 routes in bulk by their exact description.
 - Show IPv4 route descriptions.
 - List system interface IDs together with their user-defined names.
-- Use `exclusive` DNS routes.
+- Show and toggle “add automatically” and “exclusive route” on DNS rules and
+  IPv4 routes. New routes default to automatic on and exclusive off.
 - Ask for confirmation before destructive actions.
 - Keep navigation, operation results, and long paginated lists in one edited
   Telegram message instead of filling the chat with new bot messages.
@@ -227,7 +228,10 @@ existing subdomain, the bot shows the conflicts and asks whether to continue or
 cancel the operation.
 
 A new DNS list is created only after choosing an interface from the current
-Keenetic interface list. One RCI batch creates the FQDN list and an enabled DNS
+Keenetic interface list. Before that, the bot shows **Add automatically**
+(on by default) and **Exclusive route** (off by default). Turning exclusive on
+also keeps automatic add on, as Keenetic requires. One RCI batch creates the
+FQDN list and an enabled DNS
 route. The bot reads the route back and retries activation if needed. If Keenetic
 does not confirm an active route, the bot reports an error and the resulting
 list should be checked manually. Existing lists without rules are not changed
@@ -262,7 +266,8 @@ offers two search modes:
 - **partial match** — `ya` may find `ya.ru`, `yandex.ru`, and `yandex.com`.
 
 Each result includes the matched domain, the real FQDN list name, and linked DNS
-routing rules with their state, interface or gateway, and `exclusive` flag. The
+routing rules with their state, interface or gateway, plus “add automatically”
+(🔁) and “exclusive” (🔒). The
 result also indicates when a list does not have a routing rule yet.
 
 DNS rules show both the system list name and its user-defined description, for
@@ -273,8 +278,9 @@ FQDN list markers show routing state: 🟢 all rules enabled, 🟡 some enabled,
 ⚪ all disabled, and ⚠️ no rule. Lists are shown 50 per page with **Back** and
 **Next** buttons. **Enable/disable routing** in a list card
 switches all its DNS rules in one batch without deleting the list or rules. A
-list without rules needs a rule first. Manual rule creation checks that the
-system interface ID exists and confirms that the route is active. When a single
+list without rules needs a rule first. Creating a rule offers interface buttons
+and the automatic/exclusive options, then checks that the interface exists and
+confirms that the route is active. When a single
 DNS rule or IPv4 route is enabled or disabled, the bot reads its state back and
 reports an error if Keenetic did not apply the change.
 
@@ -284,7 +290,9 @@ The **Change interface selectively** button lets the user select multiple lists
 interface, and update their linked DNS rules. The **Change
 interface in all lists** button immediately selects every FQDN list that has a
 DNS routing rule. Both flows show the affected rule and list counts, require
-confirmation, and preserve rule state and the `exclusive` option.
+confirmation, and preserve rule state and the `exclusive` option. DNS rule and
+IPv4 route lists and cards show whether a route is added automatically and
+whether it is exclusive. Both options can be toggled from the card.
 
 Menus, confirmations, and operation results are displayed by editing one
 message. The bot stores its message ID across restarts. Long results use **Back**
@@ -324,7 +332,9 @@ If `DEFAULT_INTERFACE` is configured, the interface may be omitted.
 The route list and details screen show the CIDR, the system interface ID with
 its user-defined name, and Keenetic's **Description** field. The list shows 50
 routes per page with **Back** and **Next** buttons, so every route can be
-opened. An individual route's interface can be changed from its details screen.
+opened. An individual route's interface, automatic-add flag, and exclusive flag
+can be changed from its details screen. Bulk add shows the same two option
+buttons first; automatic add defaults to on, exclusive to off.
 
 The **Change interface by description** button lists unique non-empty route
 descriptions and their route counts. After choosing a description and a new

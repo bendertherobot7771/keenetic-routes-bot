@@ -116,6 +116,8 @@ def parse_ipv4_routes(
     text: str,
     *,
     default_interface: str = "",
+    auto: bool = True,
+    exclusive: bool = False,
 ) -> tuple[Ipv4Route, ...]:
     routes: list[Ipv4Route] = []
     errors: list[str] = []
@@ -146,7 +148,8 @@ def parse_ipv4_routes(
                     index="",
                     destination=str(network),
                     interface=interface,
-                    auto=True,
+                    auto=auto or exclusive,
+                    reject=exclusive,
                     comment=comment,
                 )
             )

@@ -148,7 +148,26 @@ class RciClientTests(unittest.TestCase):
         route = payload[1]["dns-proxy"]["route"]
         self.assertEqual(route["group"], "steam")
         self.assertEqual(route["interface"], "Wireguard0")
+        self.assertTrue(route["auto"])
+        self.assertFalse(route["reject"])
         self.assertFalse(route["disable"])
+        self.assertEqual(payload[-1], {"system": {"configuration": {"save": {}}}})
+
+    def test_creates_group_with_exclusive_dns_route(self) -> None:
+        self.transport.get_responses[
+            "http://127.0.0.1:79/rci/show/sc/object-group/fqdn"
+        ] = {}
+
+        self.client.create_group_with_dns_route(
+            FqdnGroup("steam", "Steam", ("steampowered.com",)),
+            "Wireguard0",
+            exclusive=True,
+        )
+
+        payload = self.transport.calls[-1][2]
+        route = payload[1]["dns-proxy"]["route"]
+        self.assertTrue(route["auto"])
+        self.assertTrue(route["reject"])
         self.assertEqual(payload[-1], {"system": {"configuration": {"save": {}}}})
 
     def test_sets_multiple_dns_routes_enabled_in_one_batch(self) -> None:

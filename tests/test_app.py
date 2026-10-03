@@ -88,14 +88,17 @@ class FakeRouter:
         self.groups = [item for item in self.groups if item.name != group.name]
         self.groups.append(group)
 
-    def create_group_with_dns_route(self, group, interface):
+    def create_group_with_dns_route(
+        self, group, interface, *, auto=True, exclusive=False
+    ):
         self.save_group(group, replace=False)
         self.save_dns_route(
             DnsRoute(
                 index=str(len(self.rules) + 1),
                 group=group.name,
                 interface=interface,
-                auto=True,
+                auto=auto or exclusive,
+                reject=exclusive,
                 enabled=True,
             )
         )
@@ -127,6 +130,12 @@ class FakeRouter:
 
     def list_ipv4_routes(self):
         return list(self.ipv4_routes)
+
+    def add_ipv4_routes(self, routes):
+        for route in routes:
+            self.saved_ipv4_routes.append(route)
+            index = route.index or str(len(self.ipv4_routes) + 1)
+            self.ipv4_routes.append(replace(route, index=index))
 
     def save_ipv4_route(self, route):
         self.save_ipv4_routes([route])
@@ -341,7 +350,7 @@ class AppTests(unittest.TestCase):
         self.assertIn("Yandex main", text)
         self.assertIn("u1Host", text)
         self.assertIn("Wireguard0", text)
-        self.assertIn("exclusive", text)
+        self.assertIn("🔒", text)
 
     def test_exact_domain_search_returns_only_identical_domain(self) -> None:
         self.router.groups = [
@@ -391,6 +400,8 @@ class AppTests(unittest.TestCase):
         self.assertIsNotNone(created)
         self.assertEqual(created.entries, ("api.openai.com",))
         self.assertTrue(self.router.rules[-1].enabled)
+        self.assertTrue(self.router.rules[-1].auto)
+        self.assertFalse(self.router.rules[-1].reject)
         self.assertEqual(self.router.rules[-1].interface, "Wireguard3")
 
     def test_new_group_requires_interface_and_creates_enabled_dns_rule(self) -> None:
@@ -400,19 +411,23 @@ class AppTests(unittest.TestCase):
 
         self.assertIsNone(self.router.get_group("steam"))
         self.assertIn("Выберите интерфейс", self.telegram.messages[-1][1])
+        self.assertIn("Добавлять автоматически: <b>да</b>", self.telegram.messages[-1][1])
+        self.assertIn("Эксклюзивный маршрут: <b>нет</b>", self.telegram.messages[-1][1])
         self.app.handle_update(self.callback_update("gnewif:0"))
 
         self.assertIsNotNone(self.router.get_group("steam"))
         self.assertEqual(len(self.router.rules), 1)
         self.assertTrue(self.router.rules[0].enabled)
+        self.assertTrue(self.router.rules[0].auto)
+        self.assertFalse(self.router.rules[0].reject)
         self.assertEqual(self.router.rules[0].interface, "u1Host")
         self.assertIn("Маршрутизация включена", self.telegram.messages[-1][1])
 
     def test_new_group_reactivates_rule_if_router_created_it_disabled(self) -> None:
         original_create = self.router.create_group_with_dns_route
 
-        def create_disabled(group, interface):
-            original_create(group, interface)
+        def create_disabled(group, interface, **kwargs):
+            original_create(group, interface, **kwargs)
             self.router.rules = [
                 replace(route, enabled=False) for route in self.router.rules
             ]
@@ -663,15 +678,25 @@ class AppTests(unittest.TestCase):
             ["🟢 Active · 0", "⚪ Disabled · 0", "⚠️ Missing · 0"],
         )
 
-    def test_rejects_nonexistent_interface_when_attaching_group(self) -> None:
+    def test_attaches_dns_rule_with_default_and_exclusive_options(self) -> None:
         self.app.handle_update(self.callback_update("groups"))
         self.app.handle_update(self.callback_update("g:0"))
         self.app.handle_update(self.callback_update("g_attach"))
-        self.app.handle_update(self.message_update("UnknownInterface"))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertIn("Добавлять автоматически: <b>да</b>", text)
+        self.assertIn("Эксклюзивный маршрут: <b>нет</b>", text)
+        self.assertEqual(
+            keyboard["inline_keyboard"][0][0]["callback_data"], "opt_auto"
+        )
+        self.app.handle_update(self.callback_update("opt_exclusive"))
+        self.assertIn("Эксклюзивный маршрут: <b>да</b>", self.telegram.messages[-1][1])
+        self.app.handle_update(self.callback_update("gatif:1"))
 
-        self.assertFalse(self.router.saved_dns_routes)
-        self.assertFalse(self.telegram.deleted_messages)
-        self.assertIn("не найден", self.telegram.sent_messages[-1][1])
+        saved = self.router.saved_dns_routes[-1]
+        self.assertEqual(saved.interface, "Wireguard3")
+        self.assertTrue(saved.auto)
+        self.assertTrue(saved.reject)
+        self.assertIn("Эксклюзивный маршрут: <b>да</b>", self.telegram.messages[-1][1])
 
     def test_rules_show_group_and_interface_descriptions(self) -> None:
         self.router.groups = [
@@ -753,6 +778,50 @@ class AppTests(unittest.TestCase):
 
         self.assertTrue(self.router.ipv4_routes[0].enabled)
         self.assertIn("Маршрут включён", self.telegram.messages[-1][1])
+
+    def test_dns_and_ipv4_cards_toggle_auto_and_exclusive_options(self) -> None:
+        self.router.rules = [
+            DnsRoute("1", "openai", interface="u1Host", auto=True, enabled=True)
+        ]
+        self.router.ipv4_routes = [
+            Ipv4Route("7", "149.154.160.0/20", interface="u1Host", auto=True)
+        ]
+
+        self.app.handle_update(self.callback_update("rules"))
+        self.assertIn("🔁", self.telegram.messages[-1][2]["inline_keyboard"][0][0]["text"])
+        self.app.handle_update(self.callback_update("r:0"))
+        self.app.handle_update(self.callback_update("r_exclusive"))
+        self.assertTrue(self.router.rules[0].reject)
+        self.assertTrue(self.router.rules[0].auto)
+        self.assertIn("Эксклюзивный маршрут: <b>да</b>", self.telegram.messages[-1][1])
+        self.app.handle_update(self.callback_update("r_auto"))
+        self.assertFalse(self.router.rules[0].auto)
+        self.assertFalse(self.router.rules[0].reject)
+
+        self.app.handle_update(self.callback_update("routes"))
+        self.app.handle_update(self.callback_update("ip:0"))
+        self.app.handle_update(self.callback_update("ip_exclusive"))
+        self.assertTrue(self.router.ipv4_routes[0].reject)
+        self.assertTrue(self.router.ipv4_routes[0].auto)
+        self.app.handle_update(self.callback_update("ip_auto"))
+        self.assertFalse(self.router.ipv4_routes[0].auto)
+        self.assertFalse(self.router.ipv4_routes[0].reject)
+
+    def test_ipv4_add_asks_for_route_options_before_saving(self) -> None:
+        self.app.handle_update(self.callback_update("route_add"))
+        self.app.handle_update(
+            self.message_update("149.154.160.0/20 Wireguard3 telegram")
+        )
+        self.assertFalse(self.router.saved_ipv4_routes)
+        self.assertIn("Добавлять автоматически: <b>да</b>", self.telegram.messages[-1][1])
+        self.app.handle_update(self.callback_update("opt_exclusive"))
+        self.app.handle_update(self.callback_update("ipv4_add_apply"))
+
+        saved = self.router.saved_ipv4_routes[-1]
+        self.assertEqual(saved.destination, "149.154.160.0/20")
+        self.assertTrue(saved.auto)
+        self.assertTrue(saved.reject)
+        self.assertIn("Добавлено IPv4-маршрутов: 1", self.telegram.messages[-1][1])
 
     def test_reports_ipv4_route_toggle_not_applied_by_router(self) -> None:
         self.router.ipv4_routes = [

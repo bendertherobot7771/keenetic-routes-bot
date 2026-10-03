@@ -4,7 +4,6 @@ import html
 import json
 import logging
 import os
-import shlex
 import tempfile
 import time
 from collections import defaultdict, deque
@@ -23,7 +22,6 @@ from .validation import (
     merge_entries,
     normalize_domain_search_query,
     normalize_group_name,
-    normalize_interface,
     parse_entries,
     parse_ipv4_routes,
     remove_entries,
@@ -324,29 +322,17 @@ class BotApp:
                     self._bulk_entries_prompt("remove"),
                 )
             elif callback_data == "g_attach":
-                self.sessions[user_id]["action"] = "attach_group"
-                interface_names = self._interface_names()
-                default_available = self.config.default_interface in interface_names
-                default_interface = self._format_interface(
-                    self.config.default_interface, interface_names
+                self._start_attach_group(user_id, chat_id)
+            elif callback_data.startswith("gatif:"):
+                self._attach_group_with_interface(
+                    user_id, chat_id, int(callback_data.split(":", 1)[1])
                 )
-                default_hint = (
-                    f"\nПо умолчанию: <code>{html.escape(default_interface)}</code>"
-                    if self.config.default_interface and default_available
-                    else (
-                        "\nНастроенный интерфейс по умолчанию недоступен; "
-                        "укажите действующий системный ID."
-                        if self.config.default_interface
-                        else ""
-                    )
-                )
-                self._send(
-                    chat_id,
-                    "Введите системный ID интерфейса и необязательный режим "
-                    "<code>exclusive</code>.\n"
-                    "Пример: <code>Wireguard0 exclusive</code>"
-                    f"{default_hint}\n\n/interfaces — показать интерфейсы",
-                )
+            elif callback_data == "g_back":
+                self._show_group_card(user_id, chat_id)
+            elif callback_data == "opt_auto":
+                self._toggle_session_route_option(user_id, chat_id, "auto")
+            elif callback_data == "opt_exclusive":
+                self._toggle_session_route_option(user_id, chat_id, "exclusive")
             elif callback_data == "g_toggle":
                 self._toggle_group_dns_routes(user_id, chat_id)
             elif callback_data == "g_delete":
@@ -359,6 +345,10 @@ class BotApp:
                 self._select_rule(user_id, chat_id, int(callback_data.split(":", 1)[1]))
             elif callback_data == "r_toggle":
                 self._toggle_rule(user_id, chat_id)
+            elif callback_data == "r_auto":
+                self._toggle_dns_route_option(user_id, chat_id, "auto")
+            elif callback_data == "r_exclusive":
+                self._toggle_dns_route_option(user_id, chat_id, "exclusive")
             elif callback_data == "r_interface":
                 self._show_interface_choices(
                     user_id,
@@ -426,6 +416,12 @@ class BotApp:
                 )
             elif callback_data == "ip_toggle":
                 self._toggle_ipv4_route(user_id, chat_id)
+            elif callback_data == "ip_auto":
+                self._toggle_ipv4_route_option(user_id, chat_id, "auto")
+            elif callback_data == "ip_exclusive":
+                self._toggle_ipv4_route_option(user_id, chat_id, "exclusive")
+            elif callback_data == "ipv4_add_apply":
+                self._apply_pending_ipv4_routes(user_id, chat_id)
             elif callback_data == "ip_interface":
                 self._show_interface_choices(
                     user_id,
@@ -499,12 +495,14 @@ class BotApp:
         entries = tuple(self.sessions[user_id].get("pending_entries", ()))
         if not name or not entries:
             raise ValidationError("Подтверждение устарело.")
+        self._init_route_options(user_id, reset=True)
         self._show_interface_choices(
             user_id,
             chat_id,
             title=f"Выберите интерфейс для нового списка «{name}»",
             callback_prefix="gnewif",
             cancel_callback="groups",
+            with_route_options=True,
         )
 
     def _create_group_with_interface(
@@ -520,24 +518,32 @@ class BotApp:
         interface = self._selected_interface(user_id, position)
         if self.router.get_group(name) is not None:
             raise ValidationError("Список с таким именем уже существует.")
+        auto, exclusive = self._route_options(user_id)
         self.router.create_group_with_dns_route(
-            FqdnGroup(name=name, description=name, entries=entries), interface
+            FqdnGroup(name=name, description=name, entries=entries),
+            interface,
+            auto=auto,
+            exclusive=exclusive,
         )
         self._ensure_dns_route_active(name, interface)
         self.sessions[user_id] = {"current_group": name}
         self.logger.info(
-            "Telegram user_id=%s created routed FQDN group=%r entries=%s interface=%r",
+            "Telegram user_id=%s created routed FQDN group=%r entries=%s "
+            "interface=%r auto=%s exclusive=%s",
             user_id,
             name,
             len(entries),
             interface,
+            auto,
+            exclusive,
         )
         interface_label = self._format_interface(interface, self._interface_names())
         self._send(
             chat_id,
             f"✅ Список <b>{html.escape(name)}</b> создан: {len(entries)} записей.\n"
             f"Маршрутизация включена через "
-            f"<code>{html.escape(interface_label)}</code>.",
+            f"<code>{html.escape(interface_label)}</code>.\n"
+            f"{self._format_route_options_text(auto, exclusive)}",
             keyboard=self._group_keyboard(),
         )
 
@@ -770,7 +776,7 @@ class BotApp:
                     lines.append(
                         f"• {'🟢' if route.enabled else '⚪'} "
                         f"<code>{html.escape(target)}</code>"
-                        f"{' exclusive' if route.reject else ''}"
+                        f"{self._format_route_option_flags(route)}"
                     )
             else:
                 lines.append("Правила: нет")
@@ -790,22 +796,24 @@ class BotApp:
             ),
         )
 
-    def _state_attach_group(self, user_id: int, chat_id: int, text: str) -> None:
-        group = self._current_group(user_id)
-        parts = shlex.split(text)
-        interface_value = parts[0] if parts else self.config.default_interface
-        if interface_value in {".", "-"}:
-            interface_value = self.config.default_interface
-        interface = normalize_interface(interface_value)
-        if interface not in self._interface_names():
-            raise ValidationError(
-                f"Интерфейс «{interface}» не найден. "
-                "Используйте /interfaces для выбора системного ID."
-            )
-        exclusive = any(
-            part.casefold() in {"exclusive", "эксклюзивный", "reject"}
-            for part in parts[1:]
+    def _start_attach_group(self, user_id: int, chat_id: int) -> None:
+        self._current_group(user_id)
+        self._init_route_options(user_id, reset=True)
+        self._show_interface_choices(
+            user_id,
+            chat_id,
+            title="Выберите интерфейс для DNS-правила",
+            callback_prefix="gatif",
+            cancel_callback="g_back",
+            with_route_options=True,
         )
+
+    def _attach_group_with_interface(
+        self, user_id: int, chat_id: int, position: int
+    ) -> None:
+        group = self._current_group(user_id)
+        interface = self._selected_interface(user_id, position)
+        auto, exclusive = self._route_options(user_id)
         existing = next(
             (
                 route
@@ -818,7 +826,7 @@ class BotApp:
             index=existing.index if existing else "",
             group=group.name,
             interface=interface,
-            auto=True,
+            auto=auto,
             reject=exclusive,
             enabled=True,
         )
@@ -826,10 +834,11 @@ class BotApp:
         self._ensure_dns_route_active(group.name, interface)
         self.sessions[user_id] = {"current_group": group.name}
         self.logger.info(
-            "Telegram user_id=%s attached group=%r interface=%r exclusive=%s",
+            "Telegram user_id=%s attached group=%r interface=%r auto=%s exclusive=%s",
             user_id,
             group.name,
             interface,
+            auto,
             exclusive,
         )
         group_label = self._format_group_name(group.name, {group.name: group})
@@ -840,7 +849,7 @@ class BotApp:
             chat_id,
             f"✅ Список <b>{html.escape(group_label)}</b> направлен через "
             f"<code>{html.escape(interface_label)}</code>.\n"
-            f"Эксклюзивный маршрут: {'да' if exclusive else 'нет'}.",
+            f"{self._format_route_options_text(auto, exclusive)}",
             keyboard=self._group_keyboard(),
         )
 
@@ -859,16 +868,55 @@ class BotApp:
         )
         if not new_routes:
             raise ValidationError("Все указанные маршруты уже существуют.")
-        self.router.add_ipv4_routes(new_routes)
+        self.sessions[user_id] = {"pending_ipv4_routes": new_routes}
+        self._init_route_options(user_id, reset=True)
+        self._show_ipv4_add_options(user_id, chat_id)
+
+    def _show_ipv4_add_options(self, user_id: int, chat_id: int) -> None:
+        routes = tuple(self.sessions[user_id].get("pending_ipv4_routes", ()))
+        if not routes:
+            raise ValidationError("Подтверждение устарело.")
+        auto, exclusive = self._route_options(user_id)
+        preview = "\n".join(
+            f"• <code>{html.escape(route.destination)}</code>"
+            for route in routes[:8]
+        )
+        suffix = f"\n…ещё {len(routes) - 8}" if len(routes) > 8 else ""
+        self._send(
+            chat_id,
+            f"Добавить IPv4-маршрутов: <b>{len(routes)}</b>?\n"
+            f"{self._format_route_options_text(auto, exclusive)}\n\n"
+            f"{preview}{suffix}",
+            keyboard=inline_keyboard(
+                [
+                    *self._route_option_rows(auto, exclusive),
+                    [("✅ Добавить", "ipv4_add_apply")],
+                    [("Отмена", "routes")],
+                ]
+            ),
+        )
+
+    def _apply_pending_ipv4_routes(self, user_id: int, chat_id: int) -> None:
+        routes = tuple(self.sessions[user_id].get("pending_ipv4_routes", ()))
+        if not routes:
+            raise ValidationError("Подтверждение устарело.")
+        auto, exclusive = self._route_options(user_id)
+        prepared = tuple(
+            replace(route, auto=auto, reject=exclusive) for route in routes
+        )
+        self.router.add_ipv4_routes(prepared)
         self.sessions[user_id].clear()
         self.logger.info(
-            "Telegram user_id=%s added IPv4 routes count=%s",
+            "Telegram user_id=%s added IPv4 routes count=%s auto=%s exclusive=%s",
             user_id,
-            len(new_routes),
+            len(prepared),
+            auto,
+            exclusive,
         )
         self._send(
             chat_id,
-            f"✅ Добавлено IPv4-маршрутов: {len(new_routes)}.",
+            f"✅ Добавлено IPv4-маршрутов: {len(prepared)}.\n"
+            f"{self._format_route_options_text(auto, exclusive)}",
             keyboard=self._routes_keyboard(),
         )
 
@@ -1033,6 +1081,10 @@ class BotApp:
         if group is None:
             raise ValidationError("Список больше не существует.")
         self.sessions[user_id] = {"current_group": group.name}
+        self._show_group_card(user_id, chat_id)
+
+    def _show_group_card(self, user_id: int, chat_id: int) -> None:
+        group = self._current_group(user_id)
         display_name = group.description or group.name
         linked = [
             route
@@ -1043,6 +1095,7 @@ class BotApp:
         links = (
             ", ".join(
                 f"<code>{html.escape(self._format_route_target(route, interface_names))}</code>"
+                f"{self._format_route_option_flags(route)}"
                 for route in linked
             )
             or "нет"
@@ -1198,7 +1251,8 @@ class BotApp:
             rows.append(
                 [
                     (
-                        f"{marker} {group_label} → {target}",
+                        f"{marker} {group_label} → {target}"
+                        f"{self._format_route_option_flags(route)}",
                         f"r:{position}",
                     )
                 ]
@@ -1206,7 +1260,9 @@ class BotApp:
         rows.extend([[("DNS-списки", "groups")], [("← Меню", "home")]])
         self._send(
             chat_id,
-            f"<b>Правила DNS-маршрутизации</b>\n\nВсего: {len(rules)}",
+            "<b>Правила DNS-маршрутизации</b>\n\n"
+            f"Всего: {len(rules)}\n"
+            "🔁 добавлять автоматически · 🔒 эксклюзивный",
             keyboard=inline_keyboard(rows),
         )
 
@@ -1214,6 +1270,9 @@ class BotApp:
         self.sessions[user_id] = {
             "current_rule": self._session_choice(user_id, "rule_choices", position)
         }
+        self._show_rule_card(user_id, chat_id)
+
+    def _show_rule_card(self, user_id: int, chat_id: int) -> None:
         route = self._current_rule(user_id)
         groups = {group.name: group for group in self.router.list_groups()}
         target = self._format_route_target(route, self._interface_names())
@@ -1223,9 +1282,8 @@ class BotApp:
             f"<b>{html.escape(group_label)}</b>\n\n"
             f"Назначение: <code>{html.escape(target)}</code>\n"
             f"Включено: {'да' if route.enabled else 'нет'}\n"
-            f"Автоматически: {'да' if route.auto else 'нет'}\n"
-            f"Эксклюзивный: {'да' if route.reject else 'нет'}",
-            keyboard=self._rule_keyboard(route.enabled),
+            f"{self._format_route_options_text(route.auto, route.reject)}",
+            keyboard=self._rule_keyboard(route.enabled, route.auto, route.reject),
         )
 
     def _toggle_rule(self, user_id: int, chat_id: int) -> None:
@@ -1301,7 +1359,8 @@ class BotApp:
             rows.append(
                 [
                     (
-                        f"{marker} {route.destination} → {target} · {description}",
+                        f"{marker} {route.destination} → {target} · {description}"
+                        f"{self._format_route_option_flags(route)}",
                         f"ip:{position}",
                     )
                 ]
@@ -1322,8 +1381,10 @@ class BotApp:
         )
         self._send(
             chat_id,
-            f"<b>Пользовательские IPv4-маршруты</b>\n\nВсего: {len(routes)}"
-            f"{self._page_suffix(page, page_count)}",
+            "<b>Пользовательские IPv4-маршруты</b>\n\n"
+            f"Всего: {len(routes)}"
+            f"{self._page_suffix(page, page_count)}\n"
+            "🔁 добавлять автоматически · 🔒 эксклюзивный",
             keyboard=inline_keyboard(rows),
         )
 
@@ -1333,6 +1394,9 @@ class BotApp:
                 user_id, "ipv4_choices", position
             )
         }
+        self._show_ipv4_route_card(user_id, chat_id)
+
+    def _show_ipv4_route_card(self, user_id: int, chat_id: int) -> None:
         route = self._current_ipv4_route(user_id)
         target = self._format_route_target(route, self._interface_names())
         self._send(
@@ -1341,9 +1405,10 @@ class BotApp:
             f"Назначение: <code>{html.escape(target)}</code>\n"
             f"Описание: {html.escape(route.comment or '—')}\n"
             f"Включено: {'да' if route.enabled else 'нет'}\n"
-            f"Автоматически: {'да' if route.auto else 'нет'}\n"
-            f"Эксклюзивный: {'да' if route.reject else 'нет'}",
-            keyboard=self._ipv4_route_keyboard(route.enabled),
+            f"{self._format_route_options_text(route.auto, route.reject)}",
+            keyboard=self._ipv4_route_keyboard(
+                route.enabled, route.auto, route.reject
+            ),
         )
 
     def _toggle_ipv4_route(self, user_id: int, chat_id: int) -> None:
@@ -1366,6 +1431,67 @@ class BotApp:
             f"✅ Маршрут {'включён' if not route.enabled else 'выключен'}.",
             keyboard=self._routes_keyboard(),
         )
+
+    def _toggle_dns_route_option(
+        self, user_id: int, chat_id: int, option: str
+    ) -> None:
+        route = self._current_rule(user_id)
+        auto, exclusive = self._next_route_options(route.auto, route.reject, option)
+        self.router.save_dns_route(replace(route, auto=auto, reject=exclusive))
+        updated = next(
+            (item for item in self.router.list_dns_routes() if item.index == route.index),
+            None,
+        )
+        if updated is None or updated.auto != auto or updated.reject != exclusive:
+            raise RciError("Не удалось подтвердить параметры DNS-правила.")
+        self.logger.info(
+            "Telegram user_id=%s set DNS rule index=%r auto=%s exclusive=%s",
+            user_id,
+            route.index,
+            auto,
+            exclusive,
+        )
+        self._show_rule_card(user_id, chat_id)
+
+    def _toggle_ipv4_route_option(
+        self, user_id: int, chat_id: int, option: str
+    ) -> None:
+        route = self._current_ipv4_route(user_id)
+        auto, exclusive = self._next_route_options(route.auto, route.reject, option)
+        self.router.save_ipv4_route(replace(route, auto=auto, reject=exclusive))
+        updated = self._locate_ipv4_route(
+            route.destination, route.interface, route.comment, auto, exclusive
+        )
+        self.sessions[user_id]["current_ipv4_route"] = updated.index
+        self.logger.info(
+            "Telegram user_id=%s set IPv4 route dest=%r auto=%s exclusive=%s",
+            user_id,
+            route.destination,
+            auto,
+            exclusive,
+        )
+        self._show_ipv4_route_card(user_id, chat_id)
+
+    def _locate_ipv4_route(
+        self,
+        destination: str,
+        interface: str,
+        comment: str,
+        auto: bool,
+        exclusive: bool,
+    ) -> Ipv4Route:
+        matches = [
+            route
+            for route in self.router.list_ipv4_routes()
+            if route.destination == destination
+            and route.interface == interface
+            and route.comment == comment
+            and route.auto == auto
+            and route.reject == exclusive
+        ]
+        if not matches:
+            raise RciError("Не удалось подтвердить параметры IPv4-маршрута.")
+        return matches[0]
 
     def _prepare_ipv4_delete(self, user_id: int, chat_id: int) -> None:
         route = self._current_ipv4_route(user_id)
@@ -1404,6 +1530,7 @@ class BotApp:
         title: str,
         callback_prefix: str,
         cancel_callback: str,
+        with_route_options: bool = False,
     ) -> None:
         interfaces = self.router.list_interfaces()
         if not interfaces:
@@ -1411,7 +1538,16 @@ class BotApp:
         self.sessions[user_id]["interface_choices"] = tuple(
             interface.ident for interface in interfaces
         )
+        self.sessions[user_id]["interface_picker"] = {
+            "title": title,
+            "callback_prefix": callback_prefix,
+            "cancel_callback": cancel_callback,
+            "with_route_options": with_route_options,
+        }
         rows: list[list[tuple[str, str]]] = []
+        auto, exclusive = self._route_options(user_id)
+        if with_route_options:
+            rows.extend(self._route_option_rows(auto, exclusive))
         for position, interface in enumerate(interfaces):
             label = self._format_interface(
                 interface.ident, {interface.ident: interface.description}
@@ -1425,9 +1561,14 @@ class BotApp:
                 ]
             )
         rows.append([("Отмена", cancel_callback)])
+        details = (
+            f"\n\n{self._format_route_options_text(auto, exclusive)}"
+            if with_route_options
+            else ""
+        )
         self._send(
             chat_id,
-            f"<b>{html.escape(title)}</b>",
+            f"<b>{html.escape(title)}</b>{details}",
             keyboard=inline_keyboard(rows),
         )
 
@@ -2137,10 +2278,11 @@ class BotApp:
         )
 
     @staticmethod
-    def _rule_keyboard(enabled: bool) -> dict[str, Any]:
+    def _rule_keyboard(enabled: bool, auto: bool, exclusive: bool) -> dict[str, Any]:
         return inline_keyboard(
             [
                 [(("⏸ Выключить" if enabled else "▶️ Включить"), "r_toggle")],
+                *BotApp._route_option_rows(auto, exclusive, "r_auto", "r_exclusive"),
                 [("🔄 Сменить интерфейс", "r_interface")],
                 [("🗑 Удалить правило", "r_delete")],
                 [("← К правилам", "rules"), ("← Меню", "home")],
@@ -2152,15 +2294,110 @@ class BotApp:
         return inline_keyboard([[("← К маршрутам", "routes")], [("← Меню", "home")]])
 
     @staticmethod
-    def _ipv4_route_keyboard(enabled: bool) -> dict[str, Any]:
+    def _ipv4_route_keyboard(
+        enabled: bool, auto: bool, exclusive: bool
+    ) -> dict[str, Any]:
         return inline_keyboard(
             [
                 [(("⏸ Выключить" if enabled else "▶️ Включить"), "ip_toggle")],
+                *BotApp._route_option_rows(auto, exclusive, "ip_auto", "ip_exclusive"),
                 [("🔄 Сменить интерфейс", "ip_interface")],
                 [("🗑 Удалить маршрут", "ip_delete")],
                 [("← К маршрутам", "routes"), ("← Меню", "home")],
             ]
         )
+
+    def _init_route_options(self, user_id: int, *, reset: bool = False) -> None:
+        if reset or "route_auto" not in self.sessions[user_id]:
+            self.sessions[user_id]["route_auto"] = True
+        if reset or "route_reject" not in self.sessions[user_id]:
+            self.sessions[user_id]["route_reject"] = False
+
+    def _route_options(self, user_id: int) -> tuple[bool, bool]:
+        auto = bool(self.sessions[user_id].get("route_auto", True))
+        exclusive = bool(self.sessions[user_id].get("route_reject", False))
+        if exclusive:
+            auto = True
+        return auto, exclusive
+
+    def _toggle_session_route_option(
+        self, user_id: int, chat_id: int, option: str
+    ) -> None:
+        auto, exclusive = self._next_route_options(
+            *self._route_options(user_id), option
+        )
+        self.sessions[user_id]["route_auto"] = auto
+        self.sessions[user_id]["route_reject"] = exclusive
+        self._refresh_route_options_view(user_id, chat_id)
+
+    def _refresh_route_options_view(self, user_id: int, chat_id: int) -> None:
+        if self.sessions[user_id].get("pending_ipv4_routes"):
+            self._show_ipv4_add_options(user_id, chat_id)
+            return
+        picker = self.sessions[user_id].get("interface_picker")
+        if isinstance(picker, dict):
+            self._show_interface_choices(
+                user_id,
+                chat_id,
+                title=str(picker["title"]),
+                callback_prefix=str(picker["callback_prefix"]),
+                cancel_callback=str(picker["cancel_callback"]),
+                with_route_options=bool(picker.get("with_route_options")),
+            )
+            return
+        raise ValidationError("Подтверждение устарело.")
+
+    @staticmethod
+    def _next_route_options(
+        auto: bool, exclusive: bool, option: str
+    ) -> tuple[bool, bool]:
+        if option == "auto":
+            auto = not auto
+            if not auto:
+                exclusive = False
+        elif option == "exclusive":
+            exclusive = not exclusive
+            if exclusive:
+                auto = True
+        return auto, exclusive
+
+    @staticmethod
+    def _route_option_rows(
+        auto: bool,
+        exclusive: bool,
+        auto_callback: str = "opt_auto",
+        exclusive_callback: str = "opt_exclusive",
+    ) -> list[list[tuple[str, str]]]:
+        return [
+            [
+                (
+                    f"{'✅' if auto else '⬜'} Добавлять автоматически",
+                    auto_callback,
+                )
+            ],
+            [
+                (
+                    f"{'✅' if exclusive else '⬜'} Эксклюзивный маршрут",
+                    exclusive_callback,
+                )
+            ],
+        ]
+
+    @staticmethod
+    def _format_route_options_text(auto: bool, exclusive: bool) -> str:
+        return (
+            f"Добавлять автоматически: <b>{'да' if auto else 'нет'}</b>\n"
+            f"Эксклюзивный маршрут: <b>{'да' if exclusive else 'нет'}</b>"
+        )
+
+    @staticmethod
+    def _format_route_option_flags(route: DnsRoute | Ipv4Route) -> str:
+        flags = []
+        if route.auto:
+            flags.append("🔁")
+        if route.reject:
+            flags.append("🔒")
+        return f" {''.join(flags)}" if flags else ""
 
     def _interface_names(self) -> dict[str, str]:
         return {

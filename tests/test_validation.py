@@ -77,6 +77,15 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(routes[0].destination, "149.154.160.0/20")
         self.assertEqual(routes[0].interface, "u1Host")
         self.assertEqual(routes[1].comment, "instagram facebook")
+        self.assertTrue(routes[0].auto)
+        self.assertFalse(routes[0].reject)
+
+    def test_parse_ipv4_routes_applies_exclusive_flag(self) -> None:
+        routes = parse_ipv4_routes(
+            "149.154.160.0/20 u1Host telegram", exclusive=True
+        )
+        self.assertTrue(routes[0].auto)
+        self.assertTrue(routes[0].reject)
 
     def test_parse_ipv4_routes_uses_default_interface(self) -> None:
         routes = parse_ipv4_routes("203.0.113.0/24", default_interface="Wireguard0")
