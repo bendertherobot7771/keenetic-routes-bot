@@ -1960,14 +1960,16 @@ class BotApp:
             except TelegramError as exc:
                 if "message is not modified" in str(exc).casefold():
                     return
-                if "message to edit not found" not in str(exc).casefold():
+                if not _is_uneditable_telegram_message(exc):
                     raise
                 self.logger.warning(
-                    "Telegram message disappeared chat_id=%s message_id=%s: %s",
+                    "Telegram message can no longer be edited chat_id=%s "
+                    "message_id=%s: %s",
                     chat_id,
                     message_id,
                     exc,
                 )
+                self.active_messages.pop(chat_id, None)
         result = self.telegram.send_message(chat_id, text, reply_markup=keyboard)
         sent_message_id = int(result.get("message_id", 0))
         if sent_message_id:
@@ -2304,6 +2306,20 @@ class BotApp:
                 f"настроен на {self.config.max_group_entries}. Разделите их "
                 "на несколько DNS-списков."
             )
+
+
+def _is_uneditable_telegram_message(exc: TelegramError) -> bool:
+    text = str(exc).casefold()
+    return any(
+        marker in text
+        for marker in (
+            "message to edit not found",
+            "message can't be edited",
+            "message is too old",
+            "message_id_invalid",
+            "http 400",
+        )
+    )
 
 
 def _chat_id(update: dict[str, Any]) -> int | None:

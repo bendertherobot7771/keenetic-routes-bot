@@ -121,8 +121,14 @@ class TelegramClient:
             ) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
+            detail = exc.reason
+            try:
+                payload = json.loads(exc.read().decode("utf-8"))
+                detail = str(payload.get("description") or detail)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                pass
             raise TelegramError(
-                f"Telegram API вернул HTTP {exc.code} для {method}."
+                f"Telegram API вернул HTTP {exc.code} для {method}: {detail}"
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)

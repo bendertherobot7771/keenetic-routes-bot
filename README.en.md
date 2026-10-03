@@ -289,8 +289,9 @@ confirmation, and preserve rule state and the `exclusive` option.
 Menus, confirmations, and operation results are displayed by editing one
 message. The bot stores its message ID across restarts. Long results use **Back**
 and **Next** buttons instead of creating a chain of messages. A new message is
-sent when there is no accessible bot message to edit, such as on first use or
-after the user deletes it. Successfully processed user text messages in private
+sent when there is no accessible bot message to edit: on first use, after the
+user deletes the panel, or when Telegram no longer allows editing the stored
+message, for example after 48 hours. Successfully processed user text messages in private
 chats are deleted. On processing or deletion errors, the bot sends a separate
 error message; failed input remains in the chat. Older chat history is not
 removed retroactively. [Telegram limits message deletion to 48

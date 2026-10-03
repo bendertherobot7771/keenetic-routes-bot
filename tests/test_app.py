@@ -899,6 +899,21 @@ class AppTests(unittest.TestCase):
         self.assertEqual(len(self.telegram.sent_messages), 1)
         self.assertEqual(self.telegram.edited_messages[-1][1], message_id)
 
+    def test_uneditable_panel_is_replaced_with_a_new_message(self) -> None:
+        self.app.handle_update(self.message_update("/start"))
+        self.assertEqual(len(self.telegram.sent_messages), 1)
+        stale_id = self.app.active_messages[42]
+        self.telegram.edit_error = TelegramError(
+            "Telegram API вернул HTTP 400 для editMessageText: "
+            "Bad Request: message can't be edited"
+        )
+
+        self.app.handle_update(self.message_update("/menu"))
+
+        self.assertEqual(len(self.telegram.sent_messages), 2)
+        self.assertNotEqual(self.app.active_messages[42], stale_id)
+        self.assertIn("Keenetic Routes Bot", self.telegram.sent_messages[-1][1])
+
     def test_transient_edit_error_does_not_create_replacement_panel(self) -> None:
         self.app.handle_update(self.message_update("/start"))
         self.telegram.edit_error = TelegramError("Telegram API недоступен")
