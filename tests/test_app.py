@@ -454,6 +454,39 @@ class AppTests(unittest.TestCase):
         self.app.handle_update(self.callback_update("g_toggle"))
         self.assertTrue(all(route.enabled for route in self.router.rules))
 
+    def test_group_card_shows_and_toggles_exclusive_for_all_rules(self) -> None:
+        self.router.rules = [
+            DnsRoute("1", "openai", interface="u1Host", auto=True, enabled=True),
+            DnsRoute("2", "openai", interface="Wireguard3", auto=True, enabled=True),
+        ]
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertIn("Эксклюзивный маршрут: <b>нет</b>", text)
+        self.assertIn(
+            "⬜ Эксклюзивный маршрут",
+            [row[0]["text"] for row in keyboard["inline_keyboard"]],
+        )
+
+        self.app.handle_update(self.callback_update("g_exclusive"))
+        self.assertTrue(all(route.reject for route in self.router.rules))
+        self.assertTrue(all(route.auto for route in self.router.rules))
+        text, keyboard = self.telegram.messages[-1][1:]
+        self.assertIn("Эксклюзивный маршрут: <b>да</b>", text)
+        self.assertIn(
+            "✅ Эксклюзивный маршрут",
+            [row[0]["text"] for row in keyboard["inline_keyboard"]],
+        )
+
+        self.app.handle_update(self.callback_update("g_exclusive"))
+        self.assertTrue(all(not route.reject for route in self.router.rules))
+
+    def test_group_without_rule_requires_route_before_exclusive(self) -> None:
+        self.app.handle_update(self.callback_update("groups"))
+        self.app.handle_update(self.callback_update("g:0"))
+        self.app.handle_update(self.callback_update("g_exclusive"))
+        self.assertIn("Сначала создайте правило", self.telegram.messages[-1][1])
+
     def test_group_without_rule_requires_route_before_toggle(self) -> None:
         self.app.handle_update(self.callback_update("groups"))
         self.app.handle_update(self.callback_update("g:0"))
@@ -653,10 +686,9 @@ class AppTests(unittest.TestCase):
         self.assertEqual(keyboard[0][0]["text"], "📄 Показать домены")
         self.assertEqual(keyboard[1][0]["text"], "➕ Добавить домен")
         self.assertEqual(keyboard[1][1]["text"], "➖ Удалить домен")
-        self.assertIn(
-            "⏯ Включить/выключить маршрутизацию",
-            [row[0]["text"] for row in keyboard],
-        )
+        labels = [row[0]["text"] for row in keyboard]
+        self.assertIn("⏯ Включить/выключить маршрутизацию", labels)
+        self.assertIn("🔒 Эксклюзивный: нет правила", labels)
 
     def test_group_list_marks_enabled_disabled_and_missing_rules(self) -> None:
         self.router.groups = [

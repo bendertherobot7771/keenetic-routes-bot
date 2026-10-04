@@ -335,6 +335,8 @@ class BotApp:
                 self._toggle_session_route_option(user_id, chat_id, "exclusive")
             elif callback_data == "g_toggle":
                 self._toggle_group_dns_routes(user_id, chat_id)
+            elif callback_data == "g_exclusive":
+                self._toggle_group_exclusive(user_id, chat_id)
             elif callback_data == "g_delete":
                 self._prepare_group_delete(user_id, chat_id)
             elif callback_data == "g_delete_yes":
@@ -1106,13 +1108,20 @@ class BotApp:
             else "выключена" if linked
             else "нет правила"
         )
+        exclusive_state = self._group_exclusive_state(linked)
+        exclusive_label = {
+            True: "да",
+            False: "нет",
+            None: "нет правила",
+        }.get(exclusive_state, "частично")
         self._send(
             chat_id,
             f"<b>{html.escape(display_name)}</b>\n\n"
             f"Записей: <b>{len(group.entries)}</b>\n"
             f"Правила: {links}\n"
-            f"Маршрутизация: {state}",
-            keyboard=self._group_keyboard(),
+            f"Маршрутизация: {state}\n"
+            f"Эксклюзивный маршрут: <b>{exclusive_label}</b>",
+            keyboard=self._group_keyboard(exclusive=exclusive_state),
         )
 
     def _toggle_group_dns_routes(self, user_id: int, chat_id: int) -> None:
@@ -1151,8 +1160,50 @@ class BotApp:
             f"✅ Маршрутизация списка <b>{html.escape(group.description or group.name)}</b> "
             f"{'включена' if enabled else 'выключена'} "
             f"({len(routes)} правил).",
-            keyboard=self._group_keyboard(),
+            keyboard=self._group_keyboard(
+                exclusive=self._group_exclusive_state(updated)
+            ),
         )
+
+    def _toggle_group_exclusive(self, user_id: int, chat_id: int) -> None:
+        group = self._current_group(user_id)
+        routes = [
+            route
+            for route in self.router.list_dns_routes()
+            if route.group == group.name
+        ]
+        if not routes:
+            raise ValidationError(
+                "У списка нет DNS-правила. Сначала создайте правило."
+            )
+        exclusive = not all(route.reject for route in routes)
+        updates = tuple(
+            replace(
+                route,
+                reject=exclusive,
+                auto=True if exclusive else route.auto,
+            )
+            for route in routes
+        )
+        self.router.save_dns_routes(updates)
+        updated = [
+            route
+            for route in self.router.list_dns_routes()
+            if route.group == group.name
+        ]
+        if len(updated) != len(routes) or any(
+            route.reject != exclusive or (exclusive and not route.auto)
+            for route in updated
+        ):
+            raise RciError("Не удалось подтвердить эксклюзивный режим списка.")
+        self.logger.info(
+            "Telegram user_id=%s set FQDN group=%r routes=%s exclusive=%s",
+            user_id,
+            group.name,
+            len(routes),
+            exclusive,
+        )
+        self._show_group_card(user_id, chat_id)
 
     def _ensure_dns_route_active(self, group: str, interface: str) -> None:
         matching = [
@@ -2261,7 +2312,24 @@ class BotApp:
         )
 
     @staticmethod
-    def _group_keyboard() -> dict[str, Any]:
+    def _group_exclusive_state(routes: list[DnsRoute]) -> bool | None | str:
+        if not routes:
+            return None
+        if all(route.reject for route in routes):
+            return True
+        if any(route.reject for route in routes):
+            return "partial"
+        return False
+
+    @staticmethod
+    def _group_keyboard(exclusive: bool | None | str = None) -> dict[str, Any]:
+        exclusive_label = (
+            "🔒 Эксклюзивный: нет правила"
+            if exclusive is None
+            else "🔒 Эксклюзивный: частично"
+            if exclusive == "partial"
+            else f"{'✅' if exclusive else '⬜'} Эксклюзивный маршрут"
+        )
         return inline_keyboard(
             [
                 [("📄 Показать домены", "g_show")],
@@ -2272,6 +2340,7 @@ class BotApp:
                 [("🧹 Убрать дубликаты", "groups_dedupe")],
                 [("🔗 Создать правило", "g_attach")],
                 [("⏯ Включить/выключить маршрутизацию", "g_toggle")],
+                [(exclusive_label, "g_exclusive")],
                 [("🗑 Удалить список", "g_delete")],
                 [("← К спискам", "groups"), ("← Меню", "home")],
             ]

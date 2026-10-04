@@ -276,7 +276,10 @@ bot as `Wireguard3 (fastVPS_Estonia)`.
 
 FQDN list markers show routing state: 🟢 all rules enabled, 🟡 some enabled,
 ⚪ all disabled, and ⚠️ no rule. Lists are shown 50 per page with **Back** and
-**Next** buttons. **Enable/disable routing** in a list card
+**Next** buttons. A list card shows whether routing is exclusive and the
+**Exclusive route** button turns that mode on or off for every DNS rule of the
+list. A list without rules needs a rule first. Enabling exclusive also keeps
+automatic add on. **Enable/disable routing** in a list card
 switches all its DNS rules in one batch without deleting the list or rules. A
 list without rules needs a rule first. Creating a rule offers interface buttons
 and the automatic/exclusive options, then checks that the interface exists and
